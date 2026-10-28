@@ -39,7 +39,9 @@ Signatures the corpus lacks are derived from the SDK's `.swiftinterface` files b
 An image's functions start at the addresses listed in its `LC_FUNCTION_STARTS`, plus the entries of its Objective-C selector stubs.
 `recompile.lift_function()` turns one function into one C function that reads and writes a CPU-state struct: `X[31]`, `SP`, the four NZCV flags and `V[32]`.
 The lifter finds instructions by recursive descent from the function's entry and resume points, and words that control flow never reaches stay data.
+A `br` through a jump table is decoded when the table's base, its entries and a bound on the index are proven on every path to it: the bound from a `cmp` and `b.hi`/`b.hs` (other instructions may sit between them, as clang 21 schedules a load there) or from an `and` mask, the base from straight-line code or, for a base set before a loop, by constant propagation over the function's control-flow graph.
 When an indirect branch inside the function cannot be decoded, every instruction word of the function is lifted instead, and the branch becomes a switch over all of their addresses.
+Such a function runs slower (an undecoded table in SQLite's bytecode loop made the whole shell 2.3 times slower), and the translation report names each one in a `WARNING: ... undecoded br` line.
 The return sites of `setjmp`-family calls and the C++ landing pads become resume points, where a function can be re-entered in the middle.
 The functions are written in chunks of 6000 instructions as `image<k>_<j>.cc`, or `.c` when `GDYLD_CHUNK_LANG` is set to anything but `c++`, plus `image<k>_t.c`, which maps guest addresses to the C functions.
 The lift runs in forked worker processes when more than one lift job is allowed (`GDYLD_LIFT_JOBS`) and the images have at least 16 chunks in all.

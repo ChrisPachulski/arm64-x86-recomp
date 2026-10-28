@@ -26,6 +26,7 @@ TABLE_LOADS = {"ldrb": (1, "B"), "ldrsb": (1, "b"), "ldrh": (2, "H"), "ldrsh": (
 DEF_WINDOW = 48                                                        # instructions scanned back for a register's definition
 MAX_TABLE = 4096                                                       # entries; a larger bound is not a switch
 PAGE_WINDOW = 16                                                       # words followed after an adrp (page_uses); past it the whole page counts
+UNDECODED_MARK = "/* GD_UNDECODED_BR */"                                # first body line of a function lifted with fallback
 HUGE_SWITCH = 256                                                      # br switch cases past which a function keeps guest state in c-> (no locals)
 SVE_REG = re.compile(r"\b(?:[zp]\d{1,2}|za\d*[hvbsdq]?)\b")             # z0-z31, p0-p15, za / za0h / za1v: never NEON or scalar
 SVE_ONLY = {"addvl","addpl", "rdvl", "cntb", "cnth", "cntw", "cntd", "incb", "inch", "incw", "incd", "decb", "dech",
@@ -554,6 +555,60 @@ def jump_edges(insns: list) -> set:
     return {i.operands[-1].imm for i in insns if (i.mnemonic in BRANCH_IMM or i.mnemonic.startswith(("b.", "bc.")))
             and i.operands and i.operands[-1].type == ARM64_OP_IMM}
 
+NAC = -1                                                               # reg_values: not one constant on every path
+
+def guest_edges(insns: list, at: dict, brs: dict) -> list[list[int]]:
+    """Successor indexes per instruction as the guest runs: direct branches and the fall-through, a call returning to the
+    next instruction; a br goes to its targets in brs (br address -> (kind, targets)) and else leaves the function."""
+    out = []
+    for n, ins in enumerate(insns):
+        m = ins.mnemonic
+        if m == DATA_MNEMONIC: out.append([]); continue
+        tg = brs.get(ins.address, ("", []))[1] if m == "br" else [ins.operands[-1].imm] if (m in BRANCH_IMM or m.startswith(("b.", "bc."))) \
+            and ins.operands and ins.operands[-1].type == ARM64_OP_IMM else []
+        out.append([at[t] for t in tg if t in at] + ([n + 1] if m not in NO_FALL and n + 1 < len(insns) else []))
+    return out
+
+def reg_after(insns: list, n: int, reg: str, v: int, joins: set) -> int:
+    """reg_values' transfer: reg's value after insns[n], v before it; constant only for adr/adrp, add #imm and mov of a
+    constant (const_val's idioms, with reg's own value carried), NAC for any other write (a call clobbers CALL_CLOBBER)."""
+    i = insns[n]
+    if reg not in writes(i): return v
+    ops = i.operands
+    if not ops or ops[0].type != ARM64_OP_REG or i.reg_name(ops[0].reg)[:1] != "x" or xname(i.reg_name(ops[0].reg)) != reg: return NAC
+    if i.mnemonic in ("adr", "adrp"): return ops[1].imm
+    if i.mnemonic == "mov" and len(ops) == 2 and ops[1].type == ARM64_OP_IMM: return ops[1].imm & (2 ** 64 - 1)
+    if i.mnemonic in ("add", "mov") and len(ops) >= 2 and ops[1].type == ARM64_OP_REG:
+        src = xname(i.reg_name(ops[1].reg))
+        b = v if src == reg else const_val(insns, n, src, joins)
+        if b is None or b == NAC: return NAC
+        if i.mnemonic == "mov" and len(ops) == 2: return b
+        if i.mnemonic == "add" and len(ops) == 3 and ops[2].type == ARM64_OP_IMM:
+            return (b + (ops[2].imm << (ops[2].shift.value if ops[2].shift.type else 0))) & (2 ** 64 - 1)
+    return NAC
+
+def reg_values(insns: list, at: dict, roots: list, edges: list, reg: str, joins: set) -> list:
+    """Forward constant propagation of one x register over guest_edges: per instruction index, its value where the
+    instruction starts (None: no path reaches it, NAC: not one constant on every path). Roots hold an unknown value (the
+    caller's, a landing pad's)."""
+    val, work = [None] * len(insns), []
+    for r in roots:
+        if r in at: val[at[r]] = NAC; work.append(at[r])
+    while work:
+        n = work.pop()
+        out = reg_after(insns, n, reg, val[n], joins)
+        for t in edges[n]:
+            v = out if val[t] is None else val[t] if val[t] == out else NAC
+            if v != val[t]: val[t] = v; work.append(t)
+    return val
+
+def hoisted(h: dict, k: int, reg: str) -> int | None:
+    """reg's constant where insns[k] starts on every path of the CFG reach knows so far (h: its hoist state), else None."""
+    if "edges" not in h: h["edges"] = guest_edges(h["insns"], h["at"], h["brs"])
+    if reg not in h["vals"]: h["vals"][reg] = reg_values(h["insns"], h["at"], h["roots"], h["edges"], reg, h["joins"])
+    v = h["vals"][reg][k]
+    return None if v is None or v == NAC else v
+
 def find_def(insns: list, k: int, reg: str, joins: set) -> int | None:
     """Index of the writer of reg that every path into insns[k] passes: the nearest one in straight-line code with no join (an address in joins: branch target, resume point) after it; None at a join, a stop or the window end."""
     for j in range(k - 1, max(-1, k - DEF_WINDOW), -1):
@@ -584,37 +639,87 @@ def zero_upper(insns: list, k: int, reg: str, joins: set) -> bool:
     o = insns[j].operands if j is not None else []
     return bool(o) and o[0].type == ARM64_OP_REG and insns[j].reg_name(o[0].reg)[:1] == "w"
 
+def flag_setter(insns: list, j: int, stop: int, idx: str, joins: set) -> int | None:
+    """Index of the instruction that set the NZCV insns[j] reads, past instructions that write neither NZCV nor idx (clang
+    may schedule a load between cmp and b.hi), with no join after it; None at a join, call, stop or index `stop`."""
+    for s in range(j - 1, stop, -1):
+        if insns[s + 1].address in joins: return None
+        i = insns[s]
+        if i.mnemonic in NO_FALL or i.mnemonic in CALLS or i.mnemonic == DATA_MNEMONIC: return None
+        w = writes(i)
+        if "nzcv" in w: return s
+        if idx in w: return None
+    return None
+
+def copy_of(insns: list, s: int, a: str, b: str, joins: set) -> bool:
+    """a holds b's value where insns[s] starts (in b's compared width): a straight-line `mov a, b`, b not written since."""
+    j = find_def(insns, s, a, joins)
+    if j is None: return False
+    i = insns[j]; o = i.operands
+    if i.mnemonic != "mov" or len(o) != 2 or o[1].type != ARM64_OP_REG or xname(i.reg_name(o[1].reg)) != b: return False
+    return all(b not in writes(insns[t]) for t in range(j + 1, s))
+
+def and_twin_bound(insns: list, j: int, src: str, mask: int, stop: int, joins: set) -> int | None:
+    """Bound of `and idx, src, #mask` at insns[j] (mask < 2^32) from an earlier `and c, src, #mask` + cmp c,#N + b.hi/b.hs
+    on its straight-line path (clang recomputes the masked index after the bound check), src not written in between."""
+    for t in range(j - 1, stop, -1):
+        if insns[t + 1].address in joins: return None
+        i = insns[t]
+        if i.mnemonic in NO_FALL or i.mnemonic == DATA_MNEMONIC or src in writes(i): return None
+        if i.mnemonic not in ("b.hi", "b.hs") or i.address in joins: continue
+        s = flag_setter(insns, t, stop, "", joins)
+        if s is None or insns[s].mnemonic != "cmp" or insns[s].operands[1].type != ARM64_OP_IMM: return None
+        c = insns[s]; o = c.operands
+        d = find_def(insns, s, xname(c.reg_name(o[0].reg)), joins)
+        do = insns[d].operands if d is not None else []
+        if d is None or insns[d].mnemonic != "and" or len(do) != 3 or do[1].type != ARM64_OP_REG or do[2].type != ARM64_OP_IMM \
+                or xname(insns[d].reg_name(do[1].reg)) != src or do[2].imm != mask: return None
+        if any(src in writes(insns[u]) for u in range(d + 1, j)): return None
+        return (o[1].imm << (o[1].shift.value if o[1].shift.type else 0)) + (1 if i.mnemonic == "b.hi" else 0)
+    return None
+
 def table_bound(insns: list, k: int, idx: str, wide: bool, joins: set) -> int | None:
-    """Entry count proven on every path into the table load insns[k] (wide: the load indexes with all 64 bits): the fall-through of cmp idx,#N + b.hi/b.hs, or idx = and #(2^m-1), with no join in between (a jump past the bound)."""
+    """Entry count proven on every path into the table load insns[k] (wide: the load indexes with all 64 bits): the fall-through of cmp idx,#N + b.hi/b.hs (instructions that write neither NZCV nor idx may sit between them; the cmp may be on the register idx was copied from), or idx = and #(2^m-1) (tightened by an equal masked value's cmp: and_twin_bound), with no join in between (a jump past the bound)."""
     for j in range(k - 1, max(-1, k - DEF_WINDOW), -1):
         if insns[j + 1].address in joins: return None
         i = insns[j]
         if i.mnemonic in NO_FALL or i.mnemonic == DATA_MNEMONIC: return None
-        if i.mnemonic in ("b.hi", "b.hs") and j > 0 and insns[j - 1].mnemonic == "cmp" and i.address not in joins:
-            c = insns[j - 1]; o = c.operands
+        s = flag_setter(insns, j, max(-1, k - DEF_WINDOW), idx, joins) if i.mnemonic in ("b.hi", "b.hs") and i.address not in joins else None
+        if s is not None and insns[s].mnemonic == "cmp":
+            c = insns[s]; o = c.operands
             cw = c.reg_name(o[0].reg)
-            if xname(cw) == idx and o[1].type == ARM64_OP_IMM and (not wide or cw[0] == "x" or zero_upper(insns, j - 1, idx, joins)):
+            same = xname(cw) == idx or copy_of(insns, s, idx, xname(cw), joins)      # cmp on the register idx was copied from
+            if same and o[1].type == ARM64_OP_IMM and (not wide or cw[0] == "x" or zero_upper(insns, s, idx, joins)):
                 return (o[1].imm << (o[1].shift.value if o[1].shift.type else 0)) + (1 if i.mnemonic == "b.hi" else 0)
         if idx in writes(i):
             o = i.operands
             if i.mnemonic == "mov" and len(o) == 2 and o[1].type == ARM64_OP_REG:
                 wide = wide and i.reg_name(o[0].reg)[0] == "x"        # a w copy zero-extends: only the low half matters
                 idx = xname(i.reg_name(o[1].reg)); continue            # the bound was proven on the copy's source
-            if i.mnemonic == "and" and o[2].type == ARM64_OP_IMM and (o[2].imm + 1) & o[2].imm == 0: return o[2].imm + 1
+            if i.mnemonic == "and" and o[2].type == ARM64_OP_IMM and (o[2].imm + 1) & o[2].imm == 0:
+                t = and_twin_bound(insns, j, xname(i.reg_name(o[1].reg)), o[2].imm, max(-1, k - DEF_WINDOW), joins) \
+                    if o[1].type == ARM64_OP_REG and o[2].imm < 2 ** 32 else None
+                return o[2].imm + 1 if t is None else min(o[2].imm + 1, t)
             return None
     return None
 
-def jump_table(insns: list, j: int, lo: int, hi: int, read: object, joins: set) -> list | None:
-    """Targets of `add T, B, E{lsl|sxtw #s}` fed by a bounded ld{r,rb,rh,rsb,rsh,rsw} E,[tab, idx]; None if not that idiom."""
+def jump_table(insns: list, j: int, lo: int, hi: int, read: object, joins: set, hoist: dict | None = None) -> list | None:
+    """Targets of `add T, B, E{lsl|sxtw #s}` fed by a bounded ld{r,rb,rh,rsb,rsh,rsw} E,[tab, idx]; None if not that idiom.
+    hoist (reach's state): B or tab may be a register set before a join (a table base kept across a loop); its value comes
+    from hoisted and goes into hoist["uses"], which reach checks against the final CFG."""
     i = insns[j]; ops = i.operands
     if i.mnemonic != "add" or len(ops) != 3 or ops[2].type != ARM64_OP_REG or read is None: return None
-    base = const_val(insns, j, xname(i.reg_name(ops[1].reg)), joins)
+    pend, breg = [], xname(i.reg_name(ops[1].reg))
+    base = const_val(insns, j, breg, joins)
+    if base is None and hoist is not None and (base := hoisted(hoist, j, breg)) is not None: pend.append((j, breg, base))
     e = xname(i.reg_name(ops[2].reg))
     jl = find_def(insns, j, e, joins)
     if base is None or jl is None or insns[jl].mnemonic not in TABLE_LOADS: return None
     ld = insns[jl]; mo = ld.operands[1]
     if mo.type != ARM64_OP_MEM or not mo.mem.index or mo.mem.disp: return None
-    tab = const_val(insns, jl, xname(ld.reg_name(mo.mem.base)), joins)
+    treg = xname(ld.reg_name(mo.mem.base))
+    tab = const_val(insns, jl, treg, joins)
+    if tab is None and hoist is not None and (tab := hoisted(hoist, jl, treg)) is not None: pend.append((jl, treg, tab))
     n = table_bound(insns, jl, xname(ld.reg_name(mo.mem.index)), ld.reg_name(mo.mem.index)[0] == "x", joins)
     width, fmt = TABLE_LOADS[ld.mnemonic]
     if tab is None or n is None or not 0 < n <= MAX_TABLE: return None
@@ -630,9 +735,11 @@ def jump_table(insns: list, j: int, lo: int, hi: int, read: object, joins: set) 
     sh = ops[2].shift.value if ops[2].shift.type == ARM64_SFT_LSL else 0
     if ops[2].shift.type not in (0, ARM64_SFT_LSL): return None
     tg = [(base + (x << sh)) & (2 ** 64 - 1) for x in ents]
-    return tg if all(lo <= t < hi and t % 4 == 0 for t in tg) else None
+    if not all(lo <= t < hi and t % 4 == 0 for t in tg): return None
+    if hoist is not None: hoist["uses"] += pend
+    return tg
 
-def br_kind(insns: list, k: int, lo: int, hi: int, read: object, joins: set) -> tuple[str, list]:
+def br_kind(insns: list, k: int, lo: int, hi: int, read: object, joins: set, hoist: dict | None = None) -> tuple[str, list]:
     """Classify the br at insns[k]: ('table'|'const', in-function targets), ('tail', []) constant target outside the function, ('pointer', []) a code pointer from an argument, call or memory, ('undecoded', []) anything else."""
     reg = xname(insns[k].reg_name(insns[k].operands[0].reg))
     for _hop in range(4):
@@ -650,12 +757,12 @@ def br_kind(insns: list, k: int, lo: int, hi: int, read: object, joins: set) -> 
             m = ops[1].mem                                             # pointer from memory; indexed off a constant base = label table
             static = m.index and const_val(insns, j, xname(i.reg_name(m.base)), joins) is not None
             return ("undecoded", []) if static else ("pointer", [])
-        tg = jump_table(insns, j, lo, hi, read, joins)
+        tg = jump_table(insns, j, lo, hi, read, joins, hoist)
         return ("table", tg) if tg is not None else ("undecoded", [])
     return ("undecoded", [])
 
-def walk(insns: list, at: dict, roots: list, read: object, joins: set) -> tuple[set, dict]:
-    """One recursive-descent pass from roots -> (reached addresses, br address -> br_kind) under the given joins."""
+def walk(insns: list, at: dict, roots: list, read: object, joins: set, hoist: dict | None = None) -> tuple[set, dict]:
+    """One recursive-descent pass from roots -> (reached addresses, br address -> br_kind) under the given joins (hoist: jump_table's)."""
     lo, hi = insns[0].address, insns[-1].address + insns[-1].size
     seen, brs, work = set(), {}, [a for a in roots if a in at]
     while work:
@@ -665,7 +772,7 @@ def walk(insns: list, at: dict, roots: list, read: object, joins: set) -> tuple[
             seen.add(ins.address)
             if m == DATA_MNEMONIC: break                               # control reaches data: a loud trap there
             if m == "br":
-                brs[ins.address] = br_kind(insns, n, lo, hi, read, joins)
+                brs[ins.address] = br_kind(insns, n, lo, hi, read, joins, hoist)
                 work += [t for t in brs[ins.address][1] if t in at]
                 break
             if m in BRANCH_IMM or m.startswith(("b.", "bc.")):
@@ -679,11 +786,18 @@ def reach(insns: list, roots: list, read: object = None, inside: bool = True) ->
     """Recursive descent over one function -> (reached addresses, br address -> (kind, targets), fallback). Joins are every direct-branch target, root and decoded br target, grown to a fixed point. Fallback: an undecoded br (or a 'pointer' br while `inside`, i.e. some pointer into this function's interior may exist) may land anywhere, so every decoded word counts as reached and the br switch lists them all."""
     at = {ins.address: n for n, ins in enumerate(insns)}
     joins = jump_edges(insns) | set(roots)                             # every edge, reached or not: a superset is conservative
+    brs = {}
     for _round in range(len(insns) + 1):
-        seen, brs = walk(insns, at, roots, read, joins)
+        hoist = {"insns": insns, "at": at, "roots": roots, "brs": brs, "joins": joins, "vals": {}, "uses": []}   # optimistic: last round's CFG
+        seen, brs = walk(insns, at, roots, read, joins, hoist)
         found = {t for _k, ts in brs.values() for t in ts} - joins
         if not found: break
         joins = joins | found
+    if hoist["uses"]:                                                  # each hoisted base must hold on the final CFG, its tables' edges included
+        edges, vals = guest_edges(insns, at, brs), {}
+        for k, reg, v in hoist["uses"]:
+            if reg not in vals: vals[reg] = reg_values(insns, at, roots, edges, reg, joins)
+            if vals[reg][k] != v: return {i.address for i in insns if i.mnemonic != DATA_MNEMONIC}, brs, True
     if any(k == "undecoded" or (k == "pointer" and inside) for k, _t in brs.values()):
         return {i.address for i in insns if i.mnemonic != DATA_MNEMONIC}, brs, True
     return seen, brs, False
@@ -1101,12 +1215,13 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
     blind = frozenset(n for n, i in enumerate(insns) if i.mnemonic == "br") if fallback else frozenset()   # br edges to every word
     regs = regs and len(cases) <= HUGE_SWITCH                          # a huge every-word switch: phis per local per label stall clang
     text, decl, facts = localize(body, edges, [0] + [at[a] for a in resume or [] if a in at], regs, insns, fstarts, blind)
+    mark = "  " + UNDECODED_MARK + "\n" if fallback else ""           # gdyld's build report names these functions
     if resume:
         bad = [hex(a) for a in resume if a not in addrs]
         if bad: raise ValueError("%s: resume points outside the function: %s" % (cname, bad))
         jumps = " ".join("case %d: goto L_%x;" % (j, a) for j, a in enumerate(resume))
-        src = "void %s(CPU *restrict c, int gd_entry) {\n%s%s  switch (gd_entry) { %s default: break; }\n%s\n}\n" % (cname, decl, pre, jumps, text)
+        src = "void %s(CPU *restrict c, int gd_entry) {\n%s%s%s  switch (gd_entry) { %s default: break; }\n%s\n}\n" % (cname, mark, decl, pre, jumps, text)
     else:
-        src = "void %s(CPU *restrict c) {\n%s%s%s\n}\n" % (cname, decl, pre, text)   # restrict: guest memory never points into the host CPU struct
+        src = "void %s(CPU *restrict c) {\n%s%s%s%s\n}\n" % (cname, mark, decl, pre, text)   # restrict: guest memory never points into the host CPU struct
     kind = "extern" if has_extern else ("indirect" if has_indirect else ("intra" if calls else "leaf"))
     return src, unsupported, calls, kind, facts

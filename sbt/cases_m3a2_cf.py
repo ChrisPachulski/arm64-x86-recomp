@@ -60,6 +60,30 @@ CASES = [
      "add x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "cases": 4},
     {"name": "ctl bounded table (x0=7)", "asm": "cmp w0,#2\nb.hi out\nadr x1,table\nadr x2,A\nldrb w3,[x1,w0,uxtw]\n"
      "add x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 7}, "cases": 4},
+    {"name": "ctl bound past a load (x0=2)", "asm": "cmp w0,#2\nldr x9,[x1]\nb.hi out\nadr x1,table\nadr x2,A\n"
+     "ldrb w3,[x1,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2, 1: DATA + 0x100}, "cases": 4},
+    {"name": "ctl bound past a load (x0=7)", "asm": "cmp w0,#2\nldr x9,[x1]\nb.hi out\nadr x1,table\nadr x2,A\n"
+     "ldrb w3,[x1,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 7, 1: DATA + 0x100}, "cases": 4},
+    {"name": "ctl flags reset after the cmp", "asm": "cmp w0,#2\ncmn x9,#0\nb.hi out\nadr x1,table\nadr x2,A\n"
+     "ldrb w3,[x1,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "not_cases": 4},
+    {"name": "ctl index rewritten after the cmp", "asm": "cmp w0,#2\nmov w0,#1\nb.hi out\nadr x1,table\nadr x2,A\n"
+     "ldrb w3,[x1,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "not_cases": 4},
+    {"name": "ctl cmp on the copy's source", "asm": "mov x20,x0\ncmp w0,#2\nb.hi out\nmov w8,w20\nadr x1,table\nadr x2,A\n"
+     "ldrb w3,[x1,x8]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "cases": 4},
+    {"name": "ctl source rewritten after the copy", "asm": "mov x20,x0\nmov x0,#1\ncmp w0,#2\nb.hi out\nmov w8,w20\nadr x1,table\n"
+     "adr x2,A\nldrb w3,[x1,x8]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "not_cases": 4},
+    {"name": "ctl masked index, cmp on its twin", "asm": "and w8,w0,#0xffff\ncmp w8,#2\nb.hi out\nand x8,x0,#0xffff\nadr x1,table\n"
+     "adr x2,A\nldrb w3,[x1,x8]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "cases": 4},
+    {"name": "ctl masked index, other source", "asm": "and w8,w0,#0xffff\ncmp w8,#2\nb.hi out\nand x8,x9,#0xffff\nadr x1,table\n"
+     "adr x2,A\nldrb w3,[x1,x8]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2, 9: 2}, "not_cases": 4},
+    {"name": "ctl table base set before a join", "asm": "adr x22,table\ncbz x5,loop\nnop\nloop:\ncmp w0,#2\nb.hi out\nadr x2,A\n"
+     "ldrb w3,[x22,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "cases": 4},
+    {"name": "ctl two bases into the join", "asm": "adr x22,table\ncbz x5,loop\nadr x22,A\nloop:\ncmp w0,#2\nb.hi out\nadr x2,A\n"
+     "ldrb w3,[x22,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\n" + TABLE_TAIL, "regs": {0: 2}, "not_cases": 4},
+    {"name": "ctl a table target rebases the table", "asm": "adr x22,table\ncbz x5,loop\nnop\nloop:\ncmp w0,#2\nb.hi out\nadr x2,A\n"
+     "ldrb w3,[x22,w0,uxtw]\nadd x2,x2,x3,lsl #2\nbr x2\nout:\nmov x0,#99\nret\nA:\nmov x0,#11\nret\nB:\nadr x22,table2\n"
+     "mov w0,#0\nb loop\nC:\nmov x0,#33\nret\nD:\nmov x0,#44\nret\n.p2align 2\ntable:\n.byte 0,2,5,0\ntable2:\n.byte 7,0,0,0",
+     "regs": {0: 1}, "not_cases": 4},
     {"name": "ctl const via mov", "asm": "adr x1,B\nmov x2,x1\nbr x2\nA:\nmov x0,#11\nret\nB:\nmov x0,#22\nret", "cases": 2},
     {"name": "ctl pointer tail to caller", "asm": "ldr x0,[x1]\nbr x0\nmov x0,#7\nret", "regs": {1: DATA + 0x100},
      "mem": STOP.to_bytes(8, "little"), "cases": 1, "proof": []},
@@ -127,7 +151,8 @@ def native(src: str, raw: bytes, regs: dict, mem: bytes, hi: bytes, d: str) -> d
             "fpc": struct.unpack_from("<Q", out, 792)[0]}
 
 def run_case(case: dict) -> tuple[str, bool, str]:
-    """(name, ok, detail): oracle vs native x0..x30 and no native fault; optional br-switch case count check."""
+    """(name, ok, detail): oracle vs native x0..x30 and no native fault; optional br-switch case count check (cases: exactly;
+    not_cases: anything else, the table must not be decoded)."""
     d = tempfile.mkdtemp(prefix="m3a2cf_")
     raw = assemble(case["asm"], d)
     regs = {**case.get("regs", {}), **{i: GUEST_BASE + CODE + v for i, v in case.get("code_regs", {}).items()}, 30: STOP}
@@ -145,6 +170,7 @@ def run_case(case: dict) -> tuple[str, bool, str]:
     bad = ["x%d %#x/%#x" % (i, ora["x"][i], nat["x"][i]) for i in range(31) if ora["x"][i] != nat["x"][i]]
     bad += ["native fault %d (dispatch abort) at %#x" % (nat["fault"], nat["fpc"])] if nat["fault"] else []
     bad += ["switch cases %d, want %d" % (ncases, case["cases"])] if "cases" in case and ncases != case["cases"] else []
+    bad += ["switch cases %d, want any other count" % ncases] if "not_cases" in case and ncases == case["not_cases"] else []
     return case["name"], not bad, "x0 oracle %d native %d, switch cases %d%s" % (
         ora["x"][0], nat["x"][0], ncases, "; " + "; ".join(bad) if bad else "")
 

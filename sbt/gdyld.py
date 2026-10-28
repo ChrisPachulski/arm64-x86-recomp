@@ -996,6 +996,18 @@ def optnone(src: str) -> str:
     if src.startswith(INLINE_BODY): return "static __attribute__((optnone)) " + src[len(INLINE_BODY):]
     return "static __attribute__((optnone)) " + src[len("static "):] if src.startswith("static ") else "__attribute__((optnone)) " + src
 
+UNDECODED_FN = re.compile(r"(optnone\)\) )?void (\w+?_([0-9a-f]+))\(CPU \*restrict c[^)]*\) \{\n  " + re.escape(R.UNDECODED_MARK))
+
+def undecoded(img: dict, units: list) -> list[tuple[str, bool]]:
+    """(name, compiled without optimization) of img's functions lifted with fallback (an undecoded br: every instruction is a
+    case of their switch and guest state stays in c->), by guest symbol where the symbol table has one, else by C name."""
+    found = []
+    for path in units:
+        if path.endswith((".c", ".cc")) and os.path.exists(path):
+            with open(path) as f: found += UNDECODED_FN.findall(f.read())
+    names = {v: n for n, v in section_symbols(img).items()} if found else {}
+    return [(names.get(int(a, 16), fn), bool(o)) for o, fn, a in found]
+
 def chunk_text(img: dict, k: int, j: int, srcs: list, addrs: list, cxx: bool = False) -> str:
     """One chunk: the prelude, declarations of only the func_ names it references, its functions (huge br switches unoptimized), and its slice of the lookup (GPair rows sorted by absolute guest address; an inline cache keeps a pointer to a row). cxx: the same code as C++ (every name C linkage; the prelude's headers first, outside extern "C"; eh_helpers for the resumable functions' wrappers)."""
     if not srcs: return ""
@@ -1708,6 +1720,11 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
             os.path.basename(img["path"]), li["instructions"], len(li["units"]), li["entries"],
             "unplaceable (stores everywhere: %s)" % plans[-1][1][3] if plans[-1][1][0] else "%d functions or entry points read it at entry, %d return it" % (
                 len(plans[-1][1][1]), len(plans[-1][1][2])), peak_rss_mb()))
+        if slow := undecoded(img, li["units"]):
+            shown = ["%s%s" % (n, " (optnone)" if o else "") for n, o in slow]  # not `names`: the import list below
+            report.append("WARNING: %s: %d function%s with an undecoded br run slower (every instruction a branch target, state in "
+                          "memory): %s" % (os.path.basename(img["path"]), len(slow), "" if len(slow) == 1 else "s",
+                                           ", ".join(shown[:8]) + (", ..." if len(shown) > 8 else "")))
     everywhere, unit_flags = any(p[0] for _u, p in plans), {}
     msg_slots = {MSG_SENDS[n[1]]: IMPORT_BASE + j * IMP_SLOT for j, n in enumerate(names) if n[1] in MSG_SENDS}   # the slots gbridge binds them to
     for k, (us, (_e, readers, returners, _why)) in enumerate(plans):
