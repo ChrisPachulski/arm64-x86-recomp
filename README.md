@@ -30,8 +30,7 @@ It downloads the SQLite amalgamation and `speedtest1.c` at pinned hashes, builds
 - [mandelbrot.sql](examples/sqlite/mandelbrot.sql), the recursive query in the recording: byte-identical.
 - `speedtest1 --verify --size 25`, SQLite's own benchmark: the same verification hash.
 
-Speed depends on the compiler that built the arm64 input.
-On the same Intel iMac, suite.sql takes 0.5 s as a native x86-64 build; translated, it takes 1.3 s when Apple clang 17 built the arm64 binary (what `run.sh` does on an Intel Mac) and 3.0 s when Apple clang 21 built it.
+On the same Intel iMac, suite.sql takes 0.5 s as a native x86-64 build and 1.3 s to 1.4 s translated, whether Apple clang 17 (what `run.sh` uses on an Intel Mac) or Apple clang 21 built the arm64 binary.
 
 ## Features
 
