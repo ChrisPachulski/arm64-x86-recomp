@@ -16,6 +16,23 @@ In the code and these docs, the translated arm64 program is the guest and the In
 It is meant for arm64-only command-line programs: by default a translation is headless, and `--ui-guard-off` lets a translated app reach the window server and the GPU.
 You need the right to run any program you translate (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
+## Example: SQLite on an Intel Mac
+
+<p align="center"><img alt="On an Intel iMac: an arm64-only sqlite3 is refused with Bad CPU type, translated, then runs a Mandelbrot query" src="docs/demo/sqlite.gif" width="760"></p>
+
+The SQLite 3.54.1 shell, built for arm64 only on an Apple-silicon Mac, translated and run on an Intel iMac (Core i9-10910).
+The recording reuses compiled chunks from an earlier translation; a first translation of `sqlite3` takes about two minutes on this Mac.
+
+[examples/sqlite/run.sh](examples/sqlite/run.sh) repeats the comparison on any Intel Mac.
+It downloads the SQLite amalgamation and `speedtest1.c` at pinned hashes, builds each for arm64 and for x86-64, translates the arm64 builds, and compares their output with the native x86-64 builds:
+
+- [suite.sql](examples/sqlite/suite.sql), with an in-memory and with an on-disk database: 200,000 inserts, an index, grouping, window functions, JSON, FTS5, R*Tree, math functions and `printf` formats. The output is byte-identical.
+- [mandelbrot.sql](examples/sqlite/mandelbrot.sql), the recursive query in the recording: byte-identical.
+- `speedtest1 --verify --size 25`, SQLite's own benchmark: the same verification hash.
+
+Speed depends on the compiler that built the arm64 input.
+On the same Intel iMac, suite.sql takes 0.5 s as a native x86-64 build; translated, it takes 1.3 s when Apple clang 17 built the arm64 binary (what `run.sh` does on an Intel Mac) and 3.0 s when Apple clang 21 built it.
+
 ## Features
 
 - **Translated ahead of time** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.

@@ -47,6 +47,7 @@ HOST_LIBS = {                                                          # test ->
     "srec_set_loud": [("@rpath/libsrec.dylib", "srec.h", "libsrec.dylib")]}
 LOUD = {                                                               # test -> text the loud stop must carry
     "loud_untyped": "untyped host code pointer",
+    "loud_nullfn": "indirect branch to an unmapped target",
     "ldp_loud": "GDYLD_LINK_ERROR: host import passes long double through memory",
     "ldcb_loud": "GDYLD_LINK_ERROR: host import passes long double through memory",
     "loud_sigctx": "SA_SIGINFO handler changed the machine context",
@@ -137,6 +138,8 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
         "ldbl": exe("ldbl", ["ldbl.c"], ["-fno-builtin"]),
         "loud_struct": exe("loud_struct", ["loud_struct.c"], ["-framework", "CoreFoundation"]),
         "loud_untyped": exe("loud_untyped", ["loud_untyped.c"]),
+        "loud_nullfn": exe("loud_nullfn", ["loud_nullfn.c"]),
+        "zone_slots": exe("zone_slots", ["zone_slots.c"]),
         "loud_block": exe("loud_block", ["loud_block.c"]),
         "loud_noescape": exe("loud_noescape", ["loud_noescape.c"]),
         "ldp_loud": [(lib("ldp_loud", "ldp"), ["ldp_lib.c"], iname("ldp"))] + exe("ldp_loud", ["ldp_main.c", lib("ldp_loud", "ldp")]),

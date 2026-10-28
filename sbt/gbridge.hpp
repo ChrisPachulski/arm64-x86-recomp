@@ -29,6 +29,8 @@
 #include <mach-o/fat.h>
 #include <libkern/OSByteOrder.h>
 #include <limits.h>
+#include <malloc/malloc.h>
+#include <mach/mach.h>
 
 typedef void (*gfn)(CPU*);
 #if __OBJC__
@@ -1233,19 +1235,56 @@ static void nslots_resolve() {
   }
 }
 /* a native slot learnt at run time (gmedia.hpp: a host library's object the guest got); readers stay lock-free: the value
-   is published before its key. The same address with another bridge stops loudly. */
+   is published before its key. The same address with another bridge stops loudly, unless keep: then the first bridge stays. */
 static pthread_mutex_t nmap_mu = PTHREAD_MUTEX_INITIALIZER;
 static int nmap_used;
-static void nslot_add(uint64_t fn, const NSlot* s) {
+static void nslot_add(uint64_t fn, const NSlot* s, bool keep = false) {
   pthread_mutex_lock(&nmap_mu);
   unsigned j = nmap_h(fn);
   while (nmap_k[j] && nmap_k[j] != fn) j = (j + 1) & (NMAP_N - 1);
-  if (nmap_k[j] && nmap_v[j]->call != s->call) die_name("native slot learnt twice with two different bridges", s->sig);
+  if (nmap_k[j] && nmap_v[j]->call != s->call && !keep) die_name("native slot learnt twice with two different bridges", s->sig);
   if (!nmap_k[j]) {
     if (GD_NNSLOT + ++nmap_used > NMAP_N / 2) die("native vtable slot table full", (uint64_t)nmap_used);
     __atomic_store_n(&nmap_v[j], s, __ATOMIC_RELEASE); __atomic_store_n(&nmap_k[j], fn, __ATOMIC_RELEASE);
   }
   pthread_mutex_unlock(&nmap_mu);
+}
+/* malloc zone function slots (malloc/malloc.h; a zone has the same layout in the arm64 guest and the x86-64 host): the guest
+   calls them through a zone pointer the host gave it (SQLite's mem1: malloc_default_zone()->size). The first call through a
+   slot of a live zone bridges every slot that zone's version has; one function in two slots keeps its first bridge. */
+struct ZSlot { size_t off; unsigned ver; NSlot s; };
+#define GD_ZSLOT(f, v) {offsetof(malloc_zone_t, f), v, \
+                        {nullptr, nullptr, 0, 0, 0, nullptr, &Inv<decltype(malloc_zone_t::f)>::call_rt, "malloc_zone_t::" #f}}
+static const ZSlot ZSLOTS[] = {
+  GD_ZSLOT(size, 0), GD_ZSLOT(malloc, 0), GD_ZSLOT(calloc, 0), GD_ZSLOT(valloc, 0), GD_ZSLOT(free, 0), GD_ZSLOT(realloc, 0),
+  GD_ZSLOT(destroy, 0), GD_ZSLOT(batch_malloc, 0), GD_ZSLOT(batch_free, 0), GD_ZSLOT(memalign, 5),
+  GD_ZSLOT(free_definite_size, 6), GD_ZSLOT(pressure_relief, 8), GD_ZSLOT(claimed_address, 10),
+  GD_ZSLOT(try_free_default, 13), GD_ZSLOT(malloc_with_options, 15), GD_ZSLOT(malloc_type_malloc, 16),
+  GD_ZSLOT(malloc_type_calloc, 16), GD_ZSLOT(malloc_type_realloc, 16), GD_ZSLOT(malloc_type_memalign, 16),
+  GD_ZSLOT(malloc_type_malloc_with_options, 16),
+};
+#undef GD_ZSLOT
+static uint64_t zslot_fn(const malloc_zone_t* z, const ZSlot& s) {
+  return z->version >= s.ver ? *(const uint64_t*)((const char*)z + s.off) : 0;
+}
+/* a is a slot of z: bridge all of z's slots */
+static bool zone_bridge(const malloc_zone_t* z, uint64_t a) {
+  bool hit = false;
+  for (const ZSlot& s : ZSLOTS) hit = hit || zslot_fn(z, s) == a;
+  if (hit)
+    for (const ZSlot& s : ZSLOTS)
+      if (uint64_t fn = zslot_fn(z, s)) nslot_add(fn, &s.s, true);
+  return hit;
+}
+static bool zone_slot(uint64_t a) {                           /* a: a slot of a live zone, now bridged */
+  if (!a) return false;                                       /* an absent slot reads 0 too */
+  if (zone_bridge(malloc_default_zone(), a)) return true;     /* libmalloc's virtual default zone is not in the zone list */
+  vm_address_t* zs = nullptr;
+  unsigned n = 0;
+  if (malloc_get_all_zones(mach_task_self(), nullptr, &zs, &n) != KERN_SUCCESS) return false;
+  for (unsigned i = 0; i < n; i++)
+    if (zone_bridge((const malloc_zone_t*)(uintptr_t)zs[i], a)) return true;
+  return false;
 }
 }  // namespace gd
 
@@ -1971,6 +2010,7 @@ extern "C" void dispatch(CPU* c, uint64_t a) {
   bool done = false;
   go::host_side(c, [&] { done = go::host_block_call(c, a) || go::host_imp_call(c, a) || gsw::host_vwt_call(c, a) || go::eh_call(c, a); });
   if (done) return;                                           /* a host block's invoke, a host IMP (exact method match), a host value witness, libobjc's EH vtable */
+  if (gd::zone_slot(a)) { dispatch(c, a); return; }           /* a malloc zone's function slot, bridged by its type */
   if (host_code((const void*)(uintptr_t)a)) {                 /* native code with no typed bridge: name it */
     Dl_info di;
     bool ok = dladdr((const void*)(uintptr_t)a, &di) && di.dli_sname;
