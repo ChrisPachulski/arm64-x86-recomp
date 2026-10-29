@@ -15,9 +15,22 @@ None of these is needed for an ordinary translation.
 | `GDYLD_ABI` | unset | `0` keeps every guest register in sync with the CPU struct at every call and return, in place of the AAPCS64 register contract ([how-it-works.md](how-it-works.md#4-lift)). |
 | `GDYLD_CHUNK_LANG` | `c++` | Any other value writes the lifted chunks as C instead of C++. |
 | `GDYLD_CHUNK_XFLAGS` | empty | Extra clang flags for the lifted chunks; the code marks it as for experiments only. |
+| `GDYLD_PGO` | unset | `generate` builds the chunks with profile instrumentation, so the translated program writes a profile when it exits (to `LLVM_PROFILE_FILE`, `default.profraw` if that is unset). A path to a profile merged with `xcrun llvm-profdata merge` builds the chunks optimized with it. |
+| `GDYLD_LTO` | unset | `thin` compiles the chunks for ThinLTO, so clang inlines between them at link time; the link takes longer and caches its work under `GDYLD_OBJCACHE`. |
 
 With `GDYLD_NZCV` at `exact` or `nob`, a flag value whose origin cannot be placed makes the whole translation store NZCV at every call and return; `direct` ignores such origins instead.
 `exact` and `nob` differ only in how they treat calls and tail calls through stubs to host imports.
+
+A profile comes from a run of an instrumented translation on a workload like the one you care about:
+
+```sh
+GDYLD_PGO=generate sbtenv/bin/python tools/translate.py prog prog-train
+LLVM_PROFILE_FILE=/tmp/prog-%p.profraw prog-train/translated < training-input
+xcrun llvm-profdata merge -o prog.profdata /tmp/prog-*.profraw
+GDYLD_PGO=prog.profdata GDYLD_LTO=thin sbtenv/bin/python tools/translate.py prog prog-fast
+```
+
+The profile is tied to the translation it came from: translate the same binary with the same translator, or clang ignores the functions that changed.
 
 ## The translated program
 

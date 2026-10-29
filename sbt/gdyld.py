@@ -69,6 +69,11 @@ CHUNK_CFLAGS = ["-O2", "-fno-strict-aliasing", "-ffp-contract=off",   # guest me
                 "-mllvm", "-slp-threshold=1",                         # SLP only when clearly profitable: else adjacent spills of two guest pointers
                                                                        # turn their loop recurrences into a vector (vmovq/vpextrq every use)
                 "-mavx2", "-mfma", "-mbmi", "-mbmi2", "-mlzcnt", "-mpopcnt", "-mf16c", "-maes", "-mpclmul"]   # Haswell-era x86-64 or newer
+PGO = os.environ.get("GDYLD_PGO", "")                                  # generate: instrument the chunks; else an llvm-profdata profile they are optimized with
+PGO_FLAGS = [] if not PGO else ["-fprofile-instr-generate"] if PGO == "generate" else [
+    "-fprofile-instr-use=" + os.path.abspath(PGO),
+    "-DGD_PGO=" + hashlib.sha256(open(PGO, "rb").read()).hexdigest()[:16]]   # the profile's hash is part of the object cache key
+LTO = os.environ.get("GDYLD_LTO", "") == "thin"                        # ThinLTO across the chunks: inlining between them, at link time
 TIME_REAL_RE = re.compile(r"^\s+([\d.]+) real\s")                    # first line of /usr/bin/time -l
 NORETURN_RE = re.compile(r"\s*__attribute__\(\(noreturn\)\)$")        # not valid in an alias; the cast drops it implicitly
 MH_MAGIC_64, CPU_ARM64, MH_DYLIB, MH_WEAK_DEFINES = 0xFEEDFACF, 0x0100000C, 6, 0x8000
@@ -1731,7 +1736,7 @@ def v8_host_flags(sdk: str, gen: str) -> list[str]:
 def c_compile_cmd(u: str, extra: list | None = None) -> list[str]:
     """clang command for one image chunk (C, or C++ for a .cc chunk; unwind tables so host exceptions cross it) -> u.o."""
     lang = [CLANGXX, "-arch", "x86_64", "-x", "c++", "-std=c++17"] if u.endswith(".cc") else [CLANG, "-arch", "x86_64"]
-    return lang + CHUNK_CFLAGS + (extra or []) + ["-w", "-funwind-tables", "-c", u, "-o", u + ".o"]
+    return lang + CHUNK_CFLAGS + PGO_FLAGS + ["-flto=thin"] * LTO + (extra or []) + ["-w", "-funwind-tables", "-c", u, "-o", u + ".o"]
 
 def compile_all(out_dir: str, units: list, link_flags: list, exe: str, host_flags: list | None = None,
                 unit_flags: dict | None = None) -> tuple[str, list]:
@@ -1792,6 +1797,7 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
                                  {k: v for ents, _f, _r in ext_out for k, v in ents.items()})
     link_flags += ["-Wl,-U," + n[1] for n in sorted(weak) if n[1] in classes.get("prototype", []) + classes.get("suffixed", [])]
     link_flags += HOST_LINK
+    link_flags += ["-fprofile-instr-generate"] * (PGO == "generate") + ["-flto=thin", "-Wl,-cache_path_lto," + os.path.join(OBJ_CACHE, "lto")] * LTO
     sw_flags, sw_report = gswift.prepare(images, names, out_dir, sdk, declared | {n[1:] for n in SPECIAL}, weak)   # swift_gen.hpp
     link_flags += sw_flags; report += sw_report
     order = init_order(images)
