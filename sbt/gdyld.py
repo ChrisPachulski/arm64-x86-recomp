@@ -179,6 +179,17 @@ LEAF_IMPORTS = frozenset("_" + n for n in (                            # gbridge
     "log logf log2 log2f log10 log10f pow powf floor floorf ceil ceilf round roundf trunc truncf fmod fmodf "
     "sinh sinhf cosh coshf tanh tanhf hypot hypotf cbrt cbrtf lround lroundf llround llroundf expm1 expm1f "
     "log1p log1pf __sincos_stret __sincosf_stret").split())
+GUEST_UNWINDER = ("__Unwind_RaiseException", "_unw_step", "__Unwind_Backtrace")   # exports of a guest unwinder (recompile GD_CSE)
+LEAF_DIRECT = {"_memcpy": "c->X[0]=(uint64_t)(uintptr_t)memcpy(GDL_P(0),GDL_P(1),(size_t)c->X[2])",
+               "_memmove": "c->X[0]=(uint64_t)(uintptr_t)memmove(GDL_P(0),GDL_P(1),(size_t)c->X[2])",
+               "_memset": "c->X[0]=(uint64_t)(uintptr_t)memset(GDL_P(0),(int)c->X[1],(size_t)c->X[2])",
+               "_memchr": "c->X[0]=(uint64_t)(uintptr_t)memchr(GDL_P(0),(int)c->X[1],(size_t)c->X[2])",
+               "_memcmp": "c->X[0]=(uint64_t)(int64_t)memcmp(GDL_P(0),GDL_P(1),(size_t)c->X[2])",
+               "_strlen": "c->X[0]=(uint64_t)strlen((const char*)GDL_P(0))",
+               "_strcmp": "c->X[0]=(uint64_t)(int64_t)strcmp((const char*)GDL_P(0),(const char*)GDL_P(1))",
+               "_strncmp": "c->X[0]=(uint64_t)(int64_t)strncmp((const char*)GDL_P(0),(const char*)GDL_P(1),(size_t)c->X[2])"}
+                                                                       # LEAF_IMPORTS a stub call runs in place (recompile GD_LEAF), as
+                                                                       # put_ret and hold encode them: int sign-extended, pointers as is
 LIBOBJC, LIBCXXABI = "/usr/lib/libobjc.A.dylib", "/usr/lib/libc++abi.dylib"   # ObjC exceptions run in the guest libc++abi
 VK = {"nil": 1, "fmt": 2, "valist": 3, "unknown": 4}                    # gobjc.hpp VK_* (variadic host method kinds)
 UI_LIB_RE = re.compile(r"/(AppKit|Metal|MetalKit|MetalFX|MetalPerformanceShaders\w*)\.framework/|/libswift(AppKit|Metal|MetalKit|QuartzCore)\.dylib$")
@@ -836,8 +847,8 @@ def abi_returns(rows: list, late: set) -> set:
         if f not in out: out.add(f); work += sorted(tails.get(f, ()))
     return out
 
-def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set]]:
-    """Per image (why its code keeps full register sync, else ''; GDA_X_ callees; GDA_G_ GOT slots; GDA_RET_ functions). A function breaks the AAPCS64 register contract when it reads registers no call passes (its entry's, and a callee's that may reach the call unchanged) or leaves callee-saved registers changed (its own writes before any save, and a callee's it saved nothing over), closed over the direct calls and tail calls of each image and the stub and GOT calls between images (recompile abi_check facts; a GOT bound into guest code calls that function). A GOT call passes on only what its callee leaves changed: an export that reads registers no call passes has a convention of its own (sp_chkstk's x9) or captures its caller's registers (the unwinder's unw_getcontext), which the site honours by storing everything (GDA_G_) and which its own image's callers cannot see (an export is address_taken). Calls into one store and reload every register, and its returns store every register, as do those of the direct callees some caller reads past the results of (abi_returns). An image keeps full sync when one of its own is reached through a pointer or an export (address_taken: an indirect call cannot tell), or when abi_ok says so. The GOT slots bound to FULL_SPILL host routines are GDA_G_ too."""
+def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set, set]]:
+    """Per image (why its code keeps full register sync, else ''; GDA_X_ callees; GDA_G_ GOT slots; GDA_RET_ functions; GDA_K_ functions: those storing every register at a return or at one of their call sites, whose prologue saves recompile saved_reads would drop stay). A function breaks the AAPCS64 register contract when it reads registers no call passes (its entry's, and a callee's that may reach the call unchanged) or leaves callee-saved registers changed (its own writes before any save, and a callee's it saved nothing over), closed over the direct calls and tail calls of each image and the stub and GOT calls between images (recompile abi_check facts; a GOT bound into guest code calls that function). A GOT call passes on only what its callee leaves changed: an export that reads registers no call passes has a convention of its own (sp_chkstk's x9) or captures its caller's registers (the unwinder's unw_getcontext), which the site honours by storing everything (GDA_G_) and which its own image's callers cannot see (an export is address_taken). Calls into one store and reload every register, and its returns store every register, as do those of the direct callees some caller reads past the results of (abi_returns). An image keeps full sync when one of its own is reached through a pointer or an export (address_taken: an indirect call cannot tell), or when abi_ok says so. The GOT slots bound to FULL_SPILL host routines are GDA_G_ too."""
     at = lambda k, a: a - images[k]["vm_base"] + images[k]["load"]     # absolute guest address
     fns = {at(k, a): (k, a, f) for k, li in enumerate(lifts) for a, f in li["abi_fn"].items()}
     ins, outs = {g: f[0] for g, (_k, _a, f) in fns.items()}, {g: f[1] for g, (_k, _a, f) in fns.items()}
@@ -861,7 +872,9 @@ def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set]]:
         why = abi_ok(img) or ("%s, and a pointer or an export reaches it%s" % (say(taken[0]), " (%d more)" % (len(taken) - 1) if len(taken) > 1 else "")
                               if taken else "")
         xg = {s for s, t in img["gbinds"].items() if t in fns and fns[t][2][0] & R.ABI_NOT_IN or outs.get(t)} | full_gots(img)
-        plan.append((why, bad, xg, abi_returns(li["flags"], li["abi_late"] | {a for a in bad if outs[at(k, a)]})))
+        rets = abi_returns(li["flags"], li["abi_late"] | {a for a in bad if outs[at(k, a)]})
+        keep = rets | {a for _g, (j, a, f) in fns.items() if j == k and any(r[1] in (bad if r[0] == "d" else xg) for r, _e, _s in f[2])}
+        plan.append((why, bad, xg, rets, keep))
     return plan
 
 def full_gots(img: dict) -> frozenset:
@@ -1257,21 +1270,24 @@ def flag_plan(rows: list, taken: list, extra: frozenset = frozenset(), mode: str
     return False, r_set, t_set, ""
 
 def flags_header(everywhere: bool, readers: set, returners: set, msg_slots: dict | None = None, abi: bool = False,
-                 rets: set = frozenset(), xd: set = frozenset(), xg: set = frozenset()) -> str:
-    """gd_flags_<k>.h text (passed with -include to the image's chunks): GD_FLAGS_ALL and the GDF_IN_ / GDF_RET_ names recompile.flag_wrap tests, GD_MSG_SLOT<k> (msg_slots: MSG_SENDS index -> its import slot address; recompile GD_MSGSEND) GD_ABI (abi: the image runs under the AAPCS64 register contract, recompile localize) and the GDA_RET_, GDA_X_ and GDA_G_ names (rets, xd, xg: abi_plan)."""
+                 rets: set = frozenset(), xd: set = frozenset(), xg: set = frozenset(), leaf: dict | None = None,
+                 cse: bool = False, keep: set = frozenset()) -> str:
+    """gd_flags_<k>.h text (passed with -include to the image's chunks): GD_FLAGS_ALL and the GDF_IN_ / GDF_RET_ names recompile.flag_wrap tests, GD_MSG_SLOT<k> (msg_slots: MSG_SENDS index -> its import slot address; recompile GD_MSGSEND) GD_ABI (abi: the image runs under the AAPCS64 register contract, recompile localize) the GDA_RET_, GDA_X_ and GDA_G_ names (rets, xd, xg: abi_plan) GDL_<got> (leaf: GOT vmaddr -> (import slot address, LEAF_DIRECT name); recompile got_call), GD_CSE (cse: no guest unwinder reads saved registers off the guest stack) and the GDA_K_ names (keep: abi_plan; recompile CSE_KEEP)."""
     slots = [] if not msg_slots else ["#define GD_MSG_SLOT%d 0x%xULL\n" % (k, (msg_slots or {}).get(k, 1)) for k in range(3)]
     return "".join(["/* generated by gdyld.py: NZCV stores at calls and returns (recompile.flag_wrap) */\n#define GD_FLAGS_ALL %d\n#define GD_ABI %d\n" % (int(everywhere), int(abi))]
                    + ["#define GDF_IN_%x 1\n" % a for a in sorted(readers)] + ["#define GDF_RET_%x 1\n" % a for a in sorted(returners)] + slots
                    + ["#define GDA_RET_%x 1\n" % a for a in sorted(rets)] + ["#define GDA_X_%x 1\n" % a for a in sorted(xd)]
-                   + ["#define GDA_G_%x 1\n" % a for a in sorted(xg)])
+                   + ["#define GDA_G_%x 1\n" % a for a in sorted(xg)]
+                   + ["#define GDL_%x GD_LEAF(0x%xULL, %s)\n" % (g, t, LEAF_DIRECT[n]) for g, (t, n) in sorted((leaf or {}).items())]
+                   + ["#define GD_CSE 1\n"] * cse + ["#define GDA_K_%x 1\n" % a for a in sorted(keep)])
 
 def dispatch_text(images: list, nimp: int, leaf: frozenset = frozenset()) -> str:
-    """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache: a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called; anything else goes to dispatch()."""
+    """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache: a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called, and so is a host function a typed native slot bridges (gbridge gd_native_pair: a malloc zone's slots); anything else goes to dispatch()."""
     find = " else ".join("if (t - 0x%xULL < 0x%xULL) p = m%d_lookup_p(t - 0x%xULL);" % (img["load"], img["vm_size"], k, img["slide"])
                          for k, img in enumerate(images))
     imps = "else if (t - 0x%xULL < 0x%xULL && (t - 0x%xULL) %% %d == 0) p = &gd_impp[(t - 0x%xULL) / %d];" % (
         IMPORT_BASE, nimp * IMP_SLOT, IMPORT_BASE, IMP_SLOT, IMPORT_BASE, IMP_SLOT)
-    return "\n".join([R.C_PRELUDE, "void gbridge(CPU*, int);", "void gbridge_leaf(CPU*, int);",
+    return "\n".join([R.C_PRELUDE, "void gbridge(CPU*, int);", "void gbridge_leaf(CPU*, int);", "const GPair* gd_native_pair(uint64_t);",
                       "const GPair gd_nopair = {1, 0};   /* matches no target: odd */"]
                      + ["const GPair* m%d_lookup_p(uint64_t);" % k for k in range(len(images))]
                      + ["static void gd_imp_%d(CPU* c) { gbridge%s(c, %d); }" % (k, "_leaf" if k in leaf else "", k) for k in range(nimp)]
@@ -1281,7 +1297,7 @@ def dispatch_text(images: list, nimp: int, leaf: frozenset = frozenset()) -> str
                         "void gd_icall_slow(CPU* c, uint64_t t, const GPair** ic) {"
                         " const GPair** e = &gd_gic[(uint32_t)((t >> 2) ^ (t >> 18)) & 0xffff];"
                         " const GPair* p = __atomic_load_n(e, __ATOMIC_RELAXED);"
-                        " if (!p || p->a != t) { p = 0; %s %s if (p) __atomic_store_n(e, p, __ATOMIC_RELAXED); }"
+                        " if (!p || p->a != t) { p = 0; %s %s if (!p) p = gd_native_pair(t); if (p) __atomic_store_n(e, p, __ATOMIC_RELAXED); }"
                         " if (p) { __atomic_store_n(ic, p, __ATOMIC_RELAXED); p->f(c); return; } dispatch(c, t); }" % (find, imps), ""])
 
 def cpu_typedefs() -> str:
@@ -1786,9 +1802,9 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     t_lift = time.time()
     lifts, lstats = lift_images(images, out_dir, [host_gots_of(img, host_binds) for img in images])
     report.append("lift: %.0f s, %s" % (time.time() - t_lift, lstats))
-    for k, (img, li, (why, xd, xg, rets)) in enumerate(zip(images, lifts, abi_plan(images, lifts))):
+    for k, (img, li, (why, xd, xg, rets, keep)) in enumerate(zip(images, lifts, abi_plan(images, lifts))):
         units += li["units"]; ninsn += li["instructions"]; nres += li["resumable"]
-        plans.append((li["units"], flag_plan(li["flags"], li["flag_readers_taken"], li["flag_extra"], host=li["flag_host"]), (not why, rets, xd, xg)))
+        plans.append((li["units"], flag_plan(li["flags"], li["flag_readers_taken"], li["flag_extra"], host=li["flag_host"]), (not why, rets, xd, xg, keep)))
         report.append("register contract %s: %s" % (os.path.basename(img["path"]), "full sync at every call (%s)" % why if why else
                                                      "AAPCS64 (callee-saved registers stay in locals; calls store arguments, returns results; "
                                                      "full stores at calls into %d functions and %d import slots outside the contract, full returns "
@@ -1803,17 +1819,22 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
             report.append("WARNING: %s: %d function%s with an undecoded br run slower (every instruction a branch target, state in "
                           "memory): %s" % (os.path.basename(img["path"]), len(slow), "" if len(slow) == 1 else "s",
                                            ", ".join(shown[:8]) + (", ..." if len(shown) > 8 else "")))
+    proto = frozenset(classes.get("prototype", []))
+    leaf = frozenset(j for j, n in enumerate(names) if not n[0] and n[1] in LEAF_IMPORTS and n[1] in proto)
+    slot = {n: j for j, n in enumerate(names)}
+    direct = [{a - img["load"] + img["vm_base"]: (IMPORT_BASE + slot[n] * IMP_SLOT, n[1]) for a, n, ad, _w in host_binds
+               if img["load"] <= a < img["load"] + img["vm_size"] and not ad and slot[n] in leaf and n[1] in LEAF_DIRECT} for img in images]
     everywhere, unit_flags = any(p[0] for _u, p, _a in plans), {}
     msg_slots = {MSG_SENDS[n[1]]: IMPORT_BASE + j * IMP_SLOT for j, n in enumerate(names) if n[1] in MSG_SENDS}   # the slots gbridge binds them to
-    for k, (us, (_e, readers, returners, _why), (abi, rets, xd, xg)) in enumerate(plans):
+    unwinder = any(n in img["exports"] for img in images for n in GUEST_UNWINDER)   # it reads saved registers off the guest stack
+    for k, (us, (_e, readers, returners, _why), (abi, rets, xd, xg, keep)) in enumerate(plans):
         hdr = os.path.abspath(os.path.join(out_dir, "gd_flags_%d.h" % k))
-        text = flags_header(everywhere, set() if everywhere else readers, set() if everywhere else returners, msg_slots, abi, rets, xd, xg)
+        text = flags_header(everywhere, set() if everywhere else readers, set() if everywhere else returners, msg_slots, abi, rets, xd, xg,
+                            direct[k], abi and not unwinder, keep)
         open(hdr, "w").write(text)
         unit_flags.update({u: ["-include", hdr, "-DGDF_H=%s" % hashlib.sha256(text.encode()).hexdigest()[:16]] for u in us if u.endswith((".c", ".cc"))})
     report.append("NZCV stores at calls and returns: %s" % ("everywhere" if everywhere else "only into flag-reading callees and out of flag-returning ones"))
     units.append(os.path.join(out_dir, "gd_disp.c"))
-    proto = frozenset(classes.get("prototype", []))
-    leaf = frozenset(j for j, n in enumerate(names) if not n[0] and n[1] in LEAF_IMPORTS and n[1] in proto)
     open(units[-1], "w").write(dispatch_text(images, len(names), leaf))
     open(os.path.join(out_dir, "bridge.hpp"), "w").write(bridge)
     vmeth = objc_variadics(sdk, [h for h in hdrs if not os.path.isabs(h)]) if LIBOBJC in host_libs(images) else []   # framework umbrellas

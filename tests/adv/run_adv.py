@@ -96,6 +96,7 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
         "abi_late": exe("abi_late", ["abi_late.c"]),
         "abi_cs": exe("abi_cs", ["abi_cs.c"]),
         "abi_ptr": exe("abi_ptr", ["abi_ptr.c"]),
+        "cse_reread": exe("cse_reread", ["cse_reread.c"]),
         "varargs": exe("varargs", ["varargs.c"]),
         "reenter": exe("reenter", ["reenter.c"]),
         "threads": exe("threads", ["threads.c"]),
