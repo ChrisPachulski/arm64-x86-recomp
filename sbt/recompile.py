@@ -98,7 +98,11 @@ C_PRELUDE = r"""
 typedef float gv4f __attribute__((vector_size(16), aligned(8))); typedef double gv2d __attribute__((vector_size(16), aligned(8))); typedef int32_t gv4i __attribute__((vector_size(16), aligned(8))); typedef int64_t gv2l __attribute__((vector_size(16), aligned(8))); typedef uint8_t gv16u8 __attribute__((vector_size(16), aligned(8))); typedef uint16_t gv8u16 __attribute__((vector_size(16), aligned(8))); typedef uint32_t gv4u32 __attribute__((vector_size(16), aligned(8))); typedef uint64_t gv2u64 __attribute__((vector_size(16), aligned(8))); typedef int8_t gv16i8 __attribute__((vector_size(16), aligned(8))); typedef int16_t gv8i16 __attribute__((vector_size(16), aligned(8))); typedef uint8_t gh8u8 __attribute__((vector_size(8))); typedef uint16_t gh4u16 __attribute__((vector_size(8))); typedef uint32_t gh2u32 __attribute__((vector_size(8))); typedef int8_t gh8i8 __attribute__((vector_size(8))); typedef int16_t gh4i16 __attribute__((vector_size(8))); typedef int32_t gh2i32 __attribute__((vector_size(8)));
 typedef union { uint64_t u64[2]; uint32_t u32[4]; uint16_t u16[8]; uint8_t u8[16]; double f64[2]; float f32[4]; gv4f vf32; gv2d vf64; gv16u8 vu8; gv8u16 vu16; gv4u32 vu32; gv2u64 vu64; } V128;
 typedef struct { uint64_t X[31]; uint64_t SP; uint32_t NF,ZF,CF,VF; V128 V[32]; int fault; uint64_t fpc; uint64_t unw; } CPU;
+#ifdef GD_NORC
+#define GD_RC(a)                                                        /* gdyld: no extra entry point in the process, so nothing sets c->unw */
+#else
 #define GD_RC(a) if (__builtin_expect(c->unw != 0, 0)) { if (c->unw != (a) + GUEST_BASE) return; c->unw = 0; }
+#endif
 #ifndef GD_FLAGS_ALL
 #define GD_FLAGS_ALL 1
 #endif
