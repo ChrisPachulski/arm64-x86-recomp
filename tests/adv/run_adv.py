@@ -92,6 +92,10 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
     return {
         "abi_host": exe("abi_host", ["abi_host.c"], ["-framework", "CoreGraphics"]),
         "abi_x": [(lib("abi_x", "abix"), ["abi_xlib.c"], iname("abix"))] + exe("abi_x", ["abi_xmain.c", lib("abi_x", "abix")]),
+        "abi_peek": exe("abi_peek", ["abi_peek.c"]),
+        "abi_late": exe("abi_late", ["abi_late.c"]),
+        "abi_cs": exe("abi_cs", ["abi_cs.c"]),
+        "abi_ptr": exe("abi_ptr", ["abi_ptr.c"]),
         "varargs": exe("varargs", ["varargs.c"]),
         "reenter": exe("reenter", ["reenter.c"]),
         "threads": exe("threads", ["threads.c"]),

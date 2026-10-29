@@ -12,6 +12,7 @@ None of these is needed for an ordinary translation.
 | `GDYLD_OBJCACHE` | `sbt/build/objcache` | Directory of the content-addressed cache of compiled chunk objects. |
 | `GDYLD_LIFT_JOBS` | the smallest of 8, half the CPU cores, and the RAM in GB divided by 8, but at least 1 | Number of forked lift workers; `1` lifts serially, one function at a time. |
 | `GDYLD_NZCV` | `nob` | How NZCV stores are placed at calls and returns: `exact`, `nob` or `direct`. |
+| `GDYLD_ABI` | unset | `0` keeps every guest register in sync with the CPU struct at every call and return, in place of the AAPCS64 register contract ([how-it-works.md](how-it-works.md#4-lift)). |
 | `GDYLD_CHUNK_LANG` | `c++` | Any other value writes the lifted chunks as C instead of C++. |
 | `GDYLD_CHUNK_XFLAGS` | empty | Extra clang flags for the lifted chunks; the code marks it as for experiments only. |
 
