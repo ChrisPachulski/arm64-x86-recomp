@@ -1990,6 +1990,42 @@ extern "C" void gd_msgsend(CPU* c, go::MIc* ic, int sup, uint64_t s) {
   TlsRestore g{tls_cur}; tls_cur = c;
   go::host_side(c, [&] { go::send(c, sup, ic); });
 }
+/* gd_icall_slow (gdyld dispatch_text), before dispatch(): a host function that dispatch() reaches through its typed native
+   slot (a malloc zone's size, free, ...) or that it found to be a host value witness gets a GPair of its own, a thunk from a
+   fixed pool, so the call site's inline cache serves the next calls without dispatch's search; none when the pool is full
+   or dispatch would resolve it otherwise. A value witness is recognised once, from the metadata of its first call (gsw::
+   host_vwt_call); that address is the same witness on every later call: a runtime value witness is never also a block's
+   invoke or an ObjC IMP (the checks dispatch runs before it), and its slot only decides whether x0 gets 32 bits */
+struct NPair { uint64_t a; void (*f)(CPU*); const NSlot* s; int vwt; };   /* a, f: recompile GPair's layout; s null: value witness slot vwt */
+enum { NPAIR_MAX = 64 };
+static NPair npair[NPAIR_MAX];
+static int npair_n;                                           /* entries below it are complete (release store, acquire load) */
+static pthread_mutex_t npair_mu = PTHREAD_MUTEX_INITIALIZER;
+template<int I> static void nthunk(CPU* c) {
+  const NPair& e = npair[I];
+  if (!e.s) { go::host_side(c, [&] { gsw::vwt_run(c, e.a, e.vwt); }); return; }
+  TlsRestore g{tls_cur}; tls_cur = c;
+  go::host_side(c, [&] { e.s->call(c, (void*)(uintptr_t)e.a); });
+}
+#define GD_NT4(i) &nthunk<i>, &nthunk<i + 1>, &nthunk<i + 2>, &nthunk<i + 3>
+#define GD_NT16(i) GD_NT4(i), GD_NT4(i + 4), GD_NT4(i + 8), GD_NT4(i + 12)
+static void (*const NTHUNK[NPAIR_MAX])(CPU*) = {GD_NT16(0), GD_NT16(16), GD_NT16(32), GD_NT16(48)};
+static const NPair* npair_find(uint64_t a) {                  /* lock-free */
+  for (int i = 0, n = __atomic_load_n(&npair_n, __ATOMIC_ACQUIRE); i < n; i++) if (npair[i].a == a) return &npair[i];
+  return nullptr;
+}
+static const NPair* npair_add(uint64_t a, const NSlot* s, int vwt) {
+  pthread_mutex_lock(&npair_mu);
+  const NPair* r = npair_find(a);
+  if (int n = npair_n; !r && n < NPAIR_MAX) { npair[n] = NPair{a, NTHUNK[n], s, vwt}; r = &npair[n]; __atomic_store_n(&npair_n, n + 1, __ATOMIC_RELEASE); }
+  pthread_mutex_unlock(&npair_mu);
+  return r;
+}
+extern "C" const void* gd_native_pair(uint64_t a) {
+  if (import_slot(a) >= 0 || handle_index(a) >= 0 || gd::host_target(a) || go::clo_target(a) || gsw::tramp_target(a)) return nullptr;
+  const NSlot* s = gd::native_slot(a);
+  return s ? npair_add(a, s, -1) : npair_find(a);             /* else a value witness dispatch() has already recognised */
+}
 extern "C" void dispatch(CPU* c, uint64_t a) {
   for (int k = 0; k < NIMG; k++)
     if (a - IMG[k].lo < IMG[k].size) {
@@ -2015,9 +2051,12 @@ extern "C" void dispatch(CPU* c, uint64_t a) {
   if (uint64_t g = go::clo_target(a)) { dispatch(c, g); return; }    /* a typed ObjC/block closure: its guest code */
   if (uint64_t g = gsw::tramp_target(a)) { dispatch(c, g); return; } /* a Swift record trampoline: its guest code */
   if (const NSlot* s = gd::native_slot(a)) { TlsRestore g{tls_cur}; tls_cur = c; go::host_side(c, [&] { s->call(c, (void*)(uintptr_t)a); }); return; }
+  if (const NPair* p = npair_find(a)) { p->f(c); return; }    /* a host value witness recognised before (a site the inline cache misses) */
   if (const char* ui = ui_code((const void*)(uintptr_t)a)) die_name(GD_UI_MARK ": the guest branched into this framework's code", ui);
   bool done = false;
-  go::host_side(c, [&] { done = go::host_block_call(c, a) || go::host_imp_call(c, a) || gsw::host_vwt_call(c, a) || go::eh_call(c, a); });
+  int vs = -1;
+  go::host_side(c, [&] { done = go::host_block_call(c, a) || go::host_imp_call(c, a) || (vs = gsw::host_vwt_call(c, a)) >= 0 || go::eh_call(c, a); });
+  if (vs >= 0) npair_add(a, nullptr, vs);                     /* the next calls skip the search (gd_native_pair, npair_find) */
   if (done) return;                                           /* a host block's invoke, a host IMP (exact method match), a host value witness, libobjc's EH vtable */
   if (gd::zone_slot(a)) { dispatch(c, a); return; }           /* a malloc zone's function slot, bridged by its type */
   if (host_code((const void*)(uintptr_t)a)) {                 /* native code with no typed bridge: name it */
@@ -2029,31 +2068,6 @@ extern "C" void dispatch(CPU* c, uint64_t a) {
     fflush(stderr); if (gd_die_hook) gd_die_hook(); _exit(70);
   }
   die("indirect branch to an unmapped target", a);
-}
-/* gd_icall_slow (gdyld dispatch_text), before dispatch(): a host function that dispatch() would reach through its typed
-   native slot (a malloc zone's size, free, ...) gets a GPair of its own, a thunk from a fixed pool, so the call site's inline
-   cache serves the next calls without dispatch's search; none when the pool is full or dispatch would resolve it otherwise */
-struct NPair { uint64_t a; void (*f)(CPU*); const NSlot* s; };   /* a, f: recompile GPair's layout */
-static NPair npair[16];
-static int npair_n;
-static pthread_mutex_t npair_mu = PTHREAD_MUTEX_INITIALIZER;
-template<int I> static void nthunk(CPU* c) {
-  const NPair& e = npair[I];
-  TlsRestore g{tls_cur}; tls_cur = c;
-  go::host_side(c, [&] { e.s->call(c, (void*)(uintptr_t)e.a); });
-}
-extern "C" const void* gd_native_pair(uint64_t a) {
-  static void (*const th[])(CPU*) = {&nthunk<0>, &nthunk<1>, &nthunk<2>, &nthunk<3>, &nthunk<4>, &nthunk<5>, &nthunk<6>, &nthunk<7>,
-    &nthunk<8>, &nthunk<9>, &nthunk<10>, &nthunk<11>, &nthunk<12>, &nthunk<13>, &nthunk<14>, &nthunk<15>};
-  if (import_slot(a) >= 0 || handle_index(a) >= 0 || gd::host_target(a) || go::clo_target(a) || gsw::tramp_target(a)) return nullptr;
-  const NSlot* s = gd::native_slot(a);
-  if (!s) return nullptr;
-  pthread_mutex_lock(&npair_mu);
-  const NPair* r = nullptr;
-  for (int i = 0; i < npair_n && !r; i++) if (npair[i].a == a) r = &npair[i];
-  if (!r && npair_n < (int)(sizeof th / sizeof th[0])) { npair[npair_n] = NPair{a, th[npair_n], s}; r = &npair[npair_n++]; }
-  pthread_mutex_unlock(&npair_mu);
-  return r;
 }
 static void* map_at(uint64_t addr, size_t len, int prot) {    /* exact address or die; never MAP_FIXED over the host */
   void* p = mmap((void*)(uintptr_t)addr, len, prot, MAP_PRIVATE | MAP_ANON, -1, 0);

@@ -220,10 +220,18 @@ static void* keypath(void* pp) {
 #endif
   return pp;
 }
+/* a call of host value witness a, slot s: value witnesses are C functions of pointer / 32-bit arguments; x0 gets 32 bits
+   from the two that return unsigned (getEnumTagSinglePayload, getEnumTag) */
+static void vwt_run(CPU* c, uint64_t a, int s) {
+  TlsRestore g{tls_cur}; tls_cur = c;
+  uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t))(uintptr_t)a)(c->X[0], c->X[1], c->X[2], c->X[3]);
+  c->X[0] = s == 6 || s == 11 ? (uint32_t)r : r;
+  if (trace) fprintf(stderr, "gsw: host value witness %d -> %llx\n", s, (unsigned long long)c->X[0]);
+}
 /* the guest called native code with no bridge (and no ObjC method has it as IMP): a host value witness, recognised from
-   the metadata argument it passes (slot s takes the metadata in x[MDREG[s]]) whose witness table is host memory;
-   value witnesses are C functions of pointer / 32-bit arguments */
-static bool host_vwt_call(CPU* c, uint64_t a) {
+   the metadata argument it passes (slot s takes the metadata in x[MDREG[s]]) whose witness table is host memory. The
+   slot it was called in, else -1 (not called) */
+static int host_vwt_call(CPU* c, uint64_t a) {
   static const int MDREG[14] = {2, 1, 2, 2, 2, 2, 2, 3, -1, -1, -1, 1, 1, 2};
   for (int s = 0; s < 14; s++) {
     if (MDREG[s] < 0) continue;
@@ -233,14 +241,11 @@ static bool host_vwt_call(CPU* c, uint64_t a) {
     if (!go::readable(vwt + 8 * s, 8) || *(const uint64_t*)(uintptr_t)(vwt + 8 * s) != a) continue;   /* readable(): at most 16 bytes */
     if (s >= 11 && !(*(const uint32_t*)(uintptr_t)(vwt + 80) & GSW_VWT_ENUM)) continue;
     if (in_guest(vwt)) continue;                              /* a host VWT is the host's (image or runtime-instantiated), never guest data */
-    TlsRestore g{tls_cur}; tls_cur = c;
     if (trace) fprintf(stderr, "gsw: host value witness %d of %llx\n", s, (unsigned long long)md), trace_call("vwt", c);
-    uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t))(uintptr_t)a)(c->X[0], c->X[1], c->X[2], c->X[3]);
-    c->X[0] = s == 6 || s == 11 ? (uint32_t)r : r;
-    if (trace) fprintf(stderr, "gsw: host value witness %d -> %llx\n", s, (unsigned long long)c->X[0]);
-    return true;
+    vwt_run(c, a, s);
+    return s;
   }
-  return false;
+  return -1;
 }
 using RegFn = void (*)(const void*, const void*);
 static void reg(const char* fn, uint64_t at, uint64_t len) {

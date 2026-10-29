@@ -1288,7 +1288,7 @@ def flags_header(everywhere: bool, readers: set, returners: set, msg_slots: dict
                    + ["#define GD_CSE 1\n"] * cse + ["#define GDA_K_%x 1\n" % a for a in sorted(keep)] + ["#define GD_NORC 1\n"] * norc)
 
 def dispatch_text(images: list, nimp: int, leaf: frozenset = frozenset()) -> str:
-    """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache: a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called, and so is a host function a typed native slot bridges (gbridge gd_native_pair: a malloc zone's slots); anything else goes to dispatch()."""
+    """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache: a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called, and so is a host function a typed native slot bridges (gbridge gd_native_pair: a malloc zone's slots, a host value witness dispatch() has recognised); anything else goes to dispatch()."""
     find = " else ".join("if (t - 0x%xULL < 0x%xULL) p = m%d_lookup_p(t - 0x%xULL);" % (img["load"], img["vm_size"], k, img["slide"])
                          for k, img in enumerate(images))
     imps = "else if (t - 0x%xULL < 0x%xULL && (t - 0x%xULL) %% %d == 0) p = &gd_impp[(t - 0x%xULL) / %d];" % (

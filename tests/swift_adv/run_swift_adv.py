@@ -20,6 +20,7 @@ ARGS = [a for a in sys.argv[1:] if a != "--corpus"]
 NAMES = ARGS or [os.path.basename(p)[:-6] for p in sorted(glob.glob(os.path.join(HERE, "a*.swift")))]
 BUILD = os.path.join(HERE, "build_corpus" if CORPUS_MODE else "build")
 ADV_SIGDB = os.path.join(HERE, "swift_sigs_adv.json")
+INSN_BOUND = {"a24_vwt_loop": 10}                             # test -> max translated / native instructions retired (whole process)
 
 ###############
 # functions
@@ -53,6 +54,14 @@ def run_exe(exe: str) -> tuple[int, str, str]:
     except subprocess.TimeoutExpired:
         return -999, "", "TIMEOUT"
 
+def insns(exe: str) -> int:
+    """Instructions retired by one run (/usr/bin/time -l), the fewer of two runs; 0 when the count is missing."""
+    got = []
+    for _ in range(2):
+        r = subprocess.run(["/usr/bin/time", "-l", exe], capture_output=True, text=True, timeout=RUN_TIMEOUT, errors="replace", cwd=os.path.dirname(exe))
+        got += [int(l.split()[0]) for l in r.stderr.splitlines() if l.strip().endswith("instructions retired")]
+    return min(got) if got else 0
+
 def save(out: str, tag: str, r: tuple[int, str, str]) -> None:
     open(os.path.join(out, tag + ".txt"), "w").write("exit %d\n--- stdout\n%s--- stderr\n%s" % r)
 
@@ -75,6 +84,12 @@ def verdict(name: str) -> str:
     info = "gdyld %.0f s, %s, unsupported insns %d" % (time.time() - t0, sw, len(res["unsupported"]))
     got = run_exe(res["exe"])
     save(out, "translated", got)
+    if (got[0], got[1]) == (oracle[0][0], oracle[0][1]) and name in INSN_BOUND:
+        nat, tr = insns(x86), insns(res["exe"])
+        ratio = tr / nat if nat and tr else float("inf")
+        if ratio > INSN_BOUND[name]:
+            return "SLOW translated %d / native %d instructions = %.1fx, bound %dx | %s" % (tr, nat, ratio, INSN_BOUND[name], info)
+        info += ", instructions %.1fx native (bound %dx)" % (ratio, INSN_BOUND[name])
     if (got[0], got[1]) == (oracle[0][0], oracle[0][1]):
         return "MATCH (exit %d, %d lines) | %s" % (got[0], len(got[1].splitlines()), info)
     diff = "".join(difflib.unified_diff(oracle[0][1].splitlines(True), got[1].splitlines(True), "native", "translated"))
