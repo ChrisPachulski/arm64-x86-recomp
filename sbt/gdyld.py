@@ -1798,6 +1798,7 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     link_flags += ["-Wl,-U," + n[1] for n in sorted(weak) if n[1] in classes.get("prototype", []) + classes.get("suffixed", [])]
     link_flags += HOST_LINK
     link_flags += ["-fprofile-instr-generate"] * (PGO == "generate") + ["-flto=thin", "-Wl,-cache_path_lto," + os.path.join(OBJ_CACHE, "lto")] * LTO
+    link_flags += ["-Wl,-mllvm," + f for k, f in enumerate(CHUNK_CFLAGS[1:], 1) if CHUNK_CFLAGS[k - 1] == "-mllvm"] * LTO   # ThinLTO generates code at link time
     sw_flags, sw_report = gswift.prepare(images, names, out_dir, sdk, declared | {n[1:] for n in SPECIAL}, weak)   # swift_gen.hpp
     link_flags += sw_flags; report += sw_report
     order = init_order(images)
