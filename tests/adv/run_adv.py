@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -57,6 +58,9 @@ LOUD = {                                                               # test ->
     "ldln_loud": "a C++ class holding a long double crosses the boundary",
     "srec_get_loud": "a record holding a SIMD vector",
     "srec_set_loud": "a record holding a SIMD vector"}
+DECODED = {                                                            # test -> (functions whose br must decode, ones that must stay undecoded)
+    "cgoto": (["_run8", "_run11"], ["_run_raw", "_run_ptr"]),
+    "cgoto_patch": (["_run_patch", "_run_word"], [])}
 LC_ROUTINES_64, ROUTINES_SIZE = 0x1A, 72
 VA_CASES = [                                                           # (name, fmt, [(kind, C expr)]); kind d=double L=long double i=int p=ptr
     ("p12", "%d %u %ld %lld %c %f %e %g %s %x %hhd %zu",
@@ -176,6 +180,8 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
         "many_closures": exe("many_closures", ["many_closures.c"]),
         "int128": exe("int128", ["int128.c"]),
         "objc_umbrella": exe("objc_umbrella", ["objc_umbrella.c"], ["-framework", "Foundation"]),
+        "cgoto": exe("cgoto", ["cgoto.c"], ["-O2"]),
+        "cgoto_patch": exe("cgoto_patch", ["cgoto_patch.c"], ["-O2"]),
     }
 
 
@@ -286,7 +292,18 @@ def translated(name: str, exe: str, sdk: str, want: str) -> list[str]:
     rc = int(got.rsplit("EXIT ", 1)[1]) if "EXIT " in got else 999
     status = (loud_status(name, got, want, rc, err) if name in LOUD else
               "translated MATCH" if got == want else "translated DIFF " + first_diff(got, want))
+    status = decode_status(name, res["report"]) or status
     return [status] + info + (["stderr: " + err[-300:]] if err else [])
+
+
+def decode_status(name: str, report: list[str]) -> str:
+    """'' when the gdyld report's undecoded-br warning names none of the test's DECODED functions and all of its must-stay-undecoded ones (a negative control); else a DECODE-MISS status line."""
+    if name not in DECODED: return ""
+    warned = " ".join(ln for ln in report if "undecoded br" in ln)
+    named = set(re.findall(r"[\w$.]+", warned))
+    must, stay = DECODED[name]
+    missed, decoded = [f for f in must if f in named], [f for f in stay if f not in named]
+    return "translated DECODE-MISS: undecoded %s; decoded %s" % (missed, decoded) if missed or decoded else ""
 
 
 def e2e_consts(path: str) -> dict[str, object]:

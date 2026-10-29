@@ -85,6 +85,7 @@ DYLIB_CMDS = {0xC: "load", 0x80000018: "weak", 0x8000001F: "reexport", 0x20: "lo
 S_SYMBOL_STUBS, S_MOD_INIT_FUNC_POINTERS, S_INTERPOSING = 0x8, 0x9, 0xD
 S_ATTR_INSTRUCTIONS = 0x80000400                                       # pure | some instructions
 VM_PROT_WRITE = 2
+SG_READ_ONLY = 0x10                                                    # dyld makes the segment read-only once its fixups are applied
 S_THREAD_LOCAL_REGULAR, S_THREAD_LOCAL_ZEROFILL, S_THREAD_LOCAL_VARIABLES, S_INIT_FUNC_OFFSETS = 0x11, 0x12, 0x13, 0x16
 CHAINED_PTR_64, CHAINED_PTR_64_OFFSET = 2, 6
 EXPORT_KIND_MASK, EXPORT_ABSOLUTE, EXPORT_WEAK, EXPORT_REEXPORT, EXPORT_RESOLVER = 0x3, 0x2, 0x4, 0x8, 0x10
@@ -223,7 +224,7 @@ def parse_image(path: str) -> dict:
         raise ValueError("%s: not a thin arm64 Mach-O" % path)
     m = {"path": os.path.realpath(path), "data": data, "filetype": filetype, "segs": [], "sects": [], "deps": [],
          "rpaths": [], "main_off": None, "chained": None, "dyld_info": None, "exports_lc": None, "fstarts_lc": None,
-         "flags": struct.unpack_from("<I", data, 24)[0], "routines": None, "id": None, "symtab": None, "sect_align": {}, "ro_segs": set()}
+         "flags": struct.unpack_from("<I", data, 24)[0], "routines": None, "id": None, "symtab": None, "sect_align": {}, "ro_segs": set(), "fixed_segs": set()}
     i = 32
     for _ in range(ncmds):
         cmd, sz = struct.unpack_from("<II", data, i)
@@ -234,6 +235,7 @@ def parse_image(path: str) -> dict:
         elif cmd == LC_SEGMENT_64:
             m["segs"].append((cstr(data[i + 8:i + 24] + b"\0", 0),) + struct.unpack_from("<4Q", data, i + 24))
             if not struct.unpack_from("<I", data, i + 60)[0] & VM_PROT_WRITE: m["ro_segs"].add(m["segs"][-1][0])   # initprot
+            if struct.unpack_from("<I", data, i + 68)[0] & SG_READ_ONLY: m["fixed_segs"].add(m["segs"][-1][0])
             for k in range(struct.unpack_from("<I", data, i + 64)[0]):
                 s = i + 72 + 80 * k
                 addr, size, off, align = struct.unpack_from("<QQII", data, s + 32)
@@ -780,10 +782,20 @@ def eh_resume_points(img: dict, bounds: list[tuple[int, int]]) -> dict[int, list
 ###############
 # C / C++ emission
 ###############
-def read_vm(img: dict, a: int, n: int) -> bytes | None:
-    """n file bytes at vmaddr a in a segment the program cannot write (initprot without write), else None: the lifter's jump-table reader, whose decoded targets are taken as complete (a writable table may be rewritten before the br)."""
-    s = next((s for s in img["segs"] if s[1] <= a and a + n <= s[1] + s[4] and s[0] in img["ro_segs"]), None)
-    return None if s is None else img["data"][s[3] + a - s[1]:s[3] + a - s[1] + n]
+def read_vm(img: dict, a: int, n: int, ptrs: bool = False) -> bytes | list | None:
+    """n file bytes at vmaddr a in a segment the program cannot write (initprot without write), else None: the lifter's jump-table reader, whose decoded targets are taken as complete (a writable table may be rewritten before the br). ptrs: instead the values of the 8-byte words from a up to n bytes, a's section end or the next symbol, whichever is first (a label table's own object), as the rebases set them (None for a word no rebase sets: its file bytes are not an address), in such a segment or one dyld makes read-only once its fixups are applied (SG_READ_ONLY: a write there faults)."""
+    if not ptrs:
+        s = next((s for s in img["segs"] if s[1] <= a and a + n <= s[1] + s[4] and s[0] in img["ro_segs"]), None)
+        return None if s is None else img["data"][s[3] + a - s[1]:s[3] + a - s[1] + n]
+    sect = next((s for s in img["sects"] if s[2] <= a < s[2] + s[3]), None)
+    if sect is None or sect[0] not in img["ro_segs"] | img["fixed_segs"]: return None
+    if "rebase_at" not in img:
+        img["rebase_at"] = dict(img["rebases"])
+        img["symbol_addrs"] = sorted(set(section_symbols(img).values()))
+    syms = img["symbol_addrs"]
+    k = bisect.bisect_right(syms, a)
+    end = min(a + n, sect[2] + sect[3], syms[k] if k < len(syms) else a + n)
+    return [img["rebase_at"].get(w) for w in range(a, end - 7, 8)]
 
 def pointer_refs(img: dict) -> list[tuple[int, int]]:
     """Sorted [lo, hi) ranges a code pointer may hold: every data rebase target, adr target and adrp page use (recompile.code_refs)."""
@@ -813,12 +825,18 @@ def interior_pointers(img: dict, fset: set | None = None, refs: list | None = No
             if w < min(hi, bounds[k][1]): out.add(w)
     return sorted(out)
 
+def refs_meeting(refs: list | None, lo: int, hi: int) -> list | None:
+    """The pointer_refs ranges (at most a page long) that meet [lo, hi); None when refs is."""
+    return None if refs is None else [r for r in refs[bisect.bisect_left(refs, (lo - 0x1000, 0)):bisect.bisect_left(refs, (hi, 0))] if r[1] > lo]
+
 def decoded_lift(read: object, ptrs: list, gots: dict, insns: list, fstarts: set, cname: str, resume: list | None = None,
-                 msg: dict | None = None, abi: bool = False, noret: frozenset = frozenset()) -> tuple:
-    """R.lift_function with the jump-table reader, the per-function proof that no code pointer lands in its interior, and inline-cached indirect and import-stub calls (gots: stub vmaddr -> GOT vmaddr; msg: GOT vmaddr -> objc_msgSend family member, msg_gots; abi: not abi_ok; noret: noreturn_starts)."""
-    k = bisect.bisect_right(ptrs, insns[0].address)
-    inside = k < len(ptrs) and ptrs[k] < insns[-1].address + insns[-1].size
-    return R.lift_function_x(insns, fstarts, cname, resume, read, inside, stubs=gots, ic=True, msg=msg, abi=abi, noret=noret)
+                 msg: dict | None = None, abi: bool = False, noret: frozenset = frozenset(), refs: list | None = None) -> tuple:
+    """R.lift_function with the jump-table reader, the per-function proof that no code pointer lands in its interior, and inline-cached indirect and import-stub calls (gots: stub vmaddr -> GOT vmaddr; msg: GOT vmaddr -> objc_msgSend family member, msg_gots; abi: not abi_ok; noret: noreturn_starts; refs: pointer_refs, of which the ranges that meet the function go to the lift: a label table's words may be rewritten to any of them)."""
+    lo, hi = insns[0].address, insns[-1].address + insns[-1].size
+    k = bisect.bisect_right(ptrs, lo)
+    inside = k < len(ptrs) and ptrs[k] < hi
+    return R.lift_function_x(insns, fstarts, cname, resume, read, inside, stubs=gots, ic=True, msg=msg, abi=abi, noret=noret,
+                             refs=refs_meeting(refs, lo, hi))
 
 def abi_ok(img: dict) -> str:
     """Why the image's code may not run under the AAPCS64 register contract (recompile localize abi), before its lift: it links a Swift library (Swift returns errors in x21 and passes self and async contexts in x20 and x22, registers C keeps across calls) or GDYLD_ABI=0; else ''."""
@@ -921,11 +939,11 @@ def interior_candidates(img: dict, bounds: list) -> dict[int, list[tuple[int, in
                 out.setdefault(starts[g], []).append((addr + 4 * n, t))
     return out
 
-def interior_entries(img: dict, bounds: list, pads: dict, sj: set, ptrs: list) -> dict[int, list[int]]:
-    """Function start -> sorted extra entry points: interior targets of direct branches that gdyld's lift reaches in another function (roots: entry, resume points, extra entries; grown to a fixed point)."""
+def interior_entries(img: dict, bounds: list, pads: dict, sj: set, ptrs: list, refs: list | None = None) -> dict[int, list[int]]:
+    """Function start -> sorted extra entry points: interior targets of direct branches that gdyld's lift reaches in another function (roots: entry, resume points, extra entries; grown to a fixed point; refs: pointer_refs, the code pointers a label table may be rewritten to, R.reach)."""
     cands, starts = interior_candidates(img, bounds), [b[0] for b in bounds]
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True; md.skipdata = True
-    read = lambda a, n: read_vm(img, a, n)
+    read = functools.partial(read_vm, img)
     ents, todo = {}, set(cands)
     while todo:
         g = min(todo); todo.discard(g)
@@ -934,7 +952,7 @@ def interior_entries(img: dict, bounds: list, pads: dict, sj: set, ptrs: list) -
         insns = list(md.disasm(data[i:i + hi - lo], lo))
         roots = [lo] + resume_points(insns, pads.get(lo, []), sj) + ents.get(lo, [])
         k = bisect.bisect_right(ptrs, lo)
-        reached, _brs, _fb = R.reach(insns, roots, read, k < len(ptrs) and ptrs[k] < hi)
+        reached, _brs, _fb = R.reach(insns, roots, read, k < len(ptrs) and ptrs[k] < hi, refs_meeting(refs, lo, hi))
         at = {x.address: x for x in insns}
         for s, t in cands[g]:
             x = at.get(s)
@@ -1142,9 +1160,9 @@ def lift_prep(img: dict) -> dict:
     bounds = function_bounds(img)
     refs = pointer_refs(img)
     ptrs = interior_pointers(img, refs=refs)
-    ents = interior_entries(img, bounds, eh_resume_points(img, bounds), setjmp_stubs(img), ptrs)
+    ents = interior_entries(img, bounds, eh_resume_points(img, bounds), setjmp_stubs(img), ptrs, refs)
     return {"refs": refs, "ents": ents, "lift": functools.partial(decoded_lift, functools.partial(read_vm, img), ptrs, stub_gots(img), msg=msg_gots(img),
-                                     abi=not abi_ok(img), noret=noreturn_starts(img) if not abi_ok(img) else frozenset())}
+                                     abi=not abi_ok(img), noret=noreturn_starts(img) if not abi_ok(img) else frozenset(), refs=refs)}
 
 def lift_finish(img: dict, k: int, out_dir: str, pre: dict, chunks: list, tot: dict, host_gots: frozenset) -> dict:
     """lift_image's result from the written chunks ([(path, index, addresses)]) and their totals: writes image<k>_t.c."""

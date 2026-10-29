@@ -25,6 +25,7 @@ BRANCH_IMM = {"b", "cbz", "cbnz", "tbz", "tbnz"}                       # direct 
 TABLE_LOADS = {"ldrb": (1, "B"), "ldrsb": (1, "b"), "ldrh": (2, "H"), "ldrsh": (2, "h"), "ldrsw": (4, "i"), "ldr": (4, "I")}
 DEF_WINDOW = 48                                                        # instructions scanned back for a register's definition
 MAX_TABLE = 4096                                                       # entries; a larger bound is not a switch
+LABEL_KINDS = ("label", "lword")                                       # br_kind's decodes of words the program may rewrite
 PAGE_WINDOW = 16                                                       # words followed after an adrp (page_uses); past it the whole page counts
 UNDECODED_MARK = "/* GD_UNDECODED_BR */"                                # first body line of a function lifted with fallback
 HUGE_SWITCH = 256                                                      # br switch cases past which a function keeps guest state in c-> (no locals)
@@ -769,8 +770,41 @@ def jump_table(insns: list, j: int, lo: int, hi: int, read: object, joins: set, 
     if hoist is not None: hoist["uses"] += pend
     return tg
 
+def label_table(insns: list, j: int, lo: int, hi: int, read: object, joins: set, hoist: dict | None = None) -> list | None:
+    """Targets of a computed goto's `ldr T, [tab, idx{, uxtw} #3]` (labels as values: a table of absolute code addresses),
+    one per entry as read(tab, n * 8, True) gives them (relocated by the image's rebases; it stops at the table's own object,
+    which may be shorter than the bound: Lua masks its opcode to 7 bits over 83 entries); None if not that idiom, the base
+    or the bound is unknown, or any entry is not a word of this function [lo, hi). An index past the decoded entries loads
+    its word at run time and goes through gd_ijump like any computed target. hoist: as jump_table's."""
+    i = insns[j]; mo = i.operands[1]
+    if read is None or i.reg_name(i.operands[0].reg)[0] != "x" or mo.mem.disp or mo.shift.type != ARM64_SFT_LSL or mo.shift.value != 3:
+        return None
+    idx = i.reg_name(mo.mem.index)
+    if mo.ext not in (0, ARM64_EXT_UXTW) or (idx[0] == "x") != (not mo.ext): return None   # a w index zero-extends; sxtw may be negative
+    pend, treg = [], xname(i.reg_name(mo.mem.base))
+    tab = const_val(insns, j, treg, joins)
+    if tab is None and hoist is not None and (tab := hoisted(hoist, j, treg)) is not None: pend.append((j, treg, tab))
+    n = table_bound(insns, j, xname(idx), idx[0] == "x", joins)
+    if tab is None or n is None or not 0 < n <= MAX_TABLE: return None
+    try: tg = read(tab, n * 8, True)
+    except TypeError: return None                                      # a bytes-only reader (test harnesses): no label tables
+    if not tg or not all(t is not None and lo <= t < hi and t % 4 == 0 for t in tg): return None
+    if hoist is not None: hoist["uses"] += pend
+    return tg
+
+def label_word(insns: list, j: int, lo: int, hi: int, read: object, joins: set) -> int | None:
+    """The word of this function [lo, hi) that `ldr T, [B, #off]` at insns[j] loads when B is a constant and the word a
+    relocated code address that cannot change (read(a, 8, True): one entry of a label table clang folded the index of),
+    else None."""
+    i = insns[j]; mo = i.operands[1]
+    base = const_val(insns, j, xname(i.reg_name(mo.mem.base)), joins) if read is not None else None
+    if base is None or i.reg_name(i.operands[0].reg)[0] != "x": return None
+    try: t = read(base + mo.mem.disp, 8, True)
+    except TypeError: return None                                      # a bytes-only reader: no label words
+    return t[0] if t and t[0] is not None and lo <= t[0] < hi and t[0] % 4 == 0 else None
+
 def table_load(insns: list, k: int, joins: set) -> int | None:
-    """Index of the table load whose entry the br at insns[k] adds to a base (br_kind's 'table' idiom: `add T, B, E` fed by `ld E, [tab, idx]`, mov copies of T followed), else None."""
+    """Index of the table load whose entry the br at insns[k] adds to a base (br_kind's 'table' idiom: `add T, B, E` fed by `ld E, [tab, idx]`, mov copies of T followed) or jumps to (label_table's `ldr T, [tab, idx, lsl #3]`), else None."""
     reg = xname(insns[k].reg_name(insns[k].operands[0].reg))
     for _hop in range(4):
         j = find_def(insns, k, reg, joins)
@@ -778,13 +812,15 @@ def table_load(insns: list, k: int, joins: set) -> int | None:
         i = insns[j]; ops = i.operands
         if i.mnemonic == "mov" and len(ops) == 2 and ops[1].type == ARM64_OP_REG:
             k, reg = j, xname(i.reg_name(ops[1].reg)); continue
+        if i.mnemonic == "ldr" and len(ops) == 2 and ops[1].type == ARM64_OP_MEM and ops[1].mem.index: return j   # label_table's
         if i.mnemonic != "add" or len(ops) != 3 or ops[2].type != ARM64_OP_REG: return None
         jl = find_def(insns, j, xname(i.reg_name(ops[2].reg)), joins)
         return jl if jl is not None and insns[jl].mnemonic in TABLE_LOADS else None
     return None
 
 def br_kind(insns: list, k: int, lo: int, hi: int, read: object, joins: set, hoist: dict | None = None) -> tuple[str, list]:
-    """Classify the br at insns[k]: ('table'|'const', in-function targets), ('tail', []) constant target outside the function, ('pointer', []) a code pointer from an argument, call or memory, ('undecoded', []) anything else."""
+    """Classify the br at insns[k]: ('table'|'const', in-function targets), ('label'|'lword', the targets of a label table or
+    of one word of it, as linked: lift_function_x checks them at run time), ('tail', []) constant target outside the function, ('pointer', []) a code pointer from an argument, call or memory, ('undecoded', []) anything else."""
     reg = xname(insns[k].reg_name(insns[k].operands[0].reg))
     for _hop in range(4):
         j = find_def(insns, k, reg, joins)
@@ -799,14 +835,18 @@ def br_kind(insns: list, k: int, lo: int, hi: int, read: object, joins: set, hoi
             return ("pointer", [])                                     # a pair of pointers from an object (closure, vtable)
         if i.mnemonic in ("ldr", "ldur", "ldapr", "ldar") and len(ops) >= 2 and ops[1].type == ARM64_OP_MEM:
             m = ops[1].mem                                             # pointer from memory; indexed off a constant base = label table
+            tg = label_table(insns, j, lo, hi, read, joins, hoist) if i.mnemonic == "ldr" and m.index else None
+            if tg is not None: return ("label", tg)
+            cv = label_word(insns, j, lo, hi, read, joins) if i.mnemonic in ("ldr", "ldur") and not m.index else None
+            if cv is not None: return ("lword", [cv])
             static = m.index and const_val(insns, j, xname(i.reg_name(m.base)), joins) is not None
             return ("undecoded", []) if static else ("pointer", [])
         tg = jump_table(insns, j, lo, hi, read, joins, hoist)
         return ("table", tg) if tg is not None else ("undecoded", [])
     return ("undecoded", [])
 
-def walk(insns: list, at: dict, roots: list, read: object, joins: set, hoist: dict | None = None) -> tuple[set, dict]:
-    """One recursive-descent pass from roots -> (reached addresses, br address -> br_kind) under the given joins (hoist: jump_table's)."""
+def walk(insns: list, at: dict, roots: list, read: object, joins: set, hoist: dict | None = None, held: list | None = None) -> tuple[set, dict]:
+    """One recursive-descent pass from roots -> (reached addresses, br address -> br_kind) under the given joins (hoist: jump_table's); held: the code pointers into the function a label table's word may be rewritten to, appended to a 'label' / 'lword' br's targets."""
     lo, hi = insns[0].address, insns[-1].address + insns[-1].size
     seen, brs, work = set(), {}, [a for a in roots if a in at]
     while work:
@@ -816,7 +856,8 @@ def walk(insns: list, at: dict, roots: list, read: object, joins: set, hoist: di
             seen.add(ins.address)
             if m == DATA_MNEMONIC: break                               # control reaches data: a loud trap there
             if m == "br":
-                brs[ins.address] = br_kind(insns, n, lo, hi, read, joins, hoist)
+                kd, tg = br_kind(insns, n, lo, hi, read, joins, hoist)
+                brs[ins.address] = (kd, tg + [t for t in held if t not in tg]) if kd in LABEL_KINDS and held else (kd, tg)
                 work += [t for t in brs[ins.address][1] if t in at]
                 break
             if m in BRANCH_IMM or m.startswith(("b.", "bc.")):
@@ -826,14 +867,15 @@ def walk(insns: list, at: dict, roots: list, read: object, joins: set, hoist: di
             n += 1
     return seen, brs
 
-def reach(insns: list, roots: list, read: object = None, inside: bool = True) -> tuple[set, dict, bool]:
-    """Recursive descent over one function -> (reached addresses, br address -> (kind, targets), fallback). Joins are every direct-branch target, root and decoded br target, grown to a fixed point. Fallback: an undecoded br (or a 'pointer' br while `inside`, i.e. some pointer into this function's interior may exist) may land anywhere, so every decoded word counts as reached and the br switch lists them all."""
+def reach(insns: list, roots: list, read: object = None, inside: bool = True, refs: list | None = None) -> tuple[set, dict, bool]:
+    """Recursive descent over one function -> (reached addresses, br address -> (kind, targets), fallback). Joins are every direct-branch target, root and decoded br target, grown to a fixed point. Fallback: an undecoded br (or a 'pointer' br while `inside`, i.e. some pointer into this function's interior may exist) may land anywhere, so every decoded word counts as reached and the br switch lists them all. A label table's words (br_kind 'label' / 'lword') may be rewritten (mprotect): its br also reaches each exact code pointer into the function among refs (gdyld pointer_refs ranges that meet it: rebase and adr targets; walk). lift_function_x checks the word at run time, so any other value (only an escaping adrp page reaches it, or misaligned) goes to dispatch, which stops loudly."""
     at = {ins.address: n for n, ins in enumerate(insns)}
-    joins = jump_edges(insns) | set(roots)                             # every edge, reached or not: a superset is conservative
+    held = sorted({l for l, h in refs or [] if h - l == 1 and l in at})  # exact code pointers a label word may be rewritten to
+    joins = jump_edges(insns) | set(roots)                               # every edge, reached or not: a superset is conservative
     brs = {}
     for _round in range(len(insns) + 1):
         hoist = {"insns": insns, "at": at, "roots": roots, "brs": brs, "joins": joins, "vals": {}, "uses": []}   # optimistic: last round's CFG
-        seen, brs = walk(insns, at, roots, read, joins, hoist)
+        seen, brs = walk(insns, at, roots, read, joins, hoist, held)
         found = {t for _k, ts in brs.values() for t in ts} - joins
         if not found: break
         joins = joins | found
@@ -973,14 +1015,15 @@ def flag_origins(edges: list, entries: list[int], insns: list, fstarts: set, bli
                 work.append(s)
     return inn
 
-def flow_edges(insns: list, reached: set, cases: set) -> list[tuple[list[int], bool]]:
-    """Per instruction index, as the lifted C runs: (successor indices, True for a call after which every local equals the CPU struct again). A br reaches every case of the function's gd_ijump switch."""
+def flow_edges(insns: list, reached: set, cases: set, shared: dict | None = None) -> list[tuple[list[int], bool]]:
+    """Per instruction index, as the lifted C runs: (successor indices, True for a call after which every local equals the CPU struct again). A br reaches every case of the function's gd_ijump switch; one in shared (br index -> the br whose switch it uses) reaches only that br."""
     at = {i.address: n for n, i in enumerate(insns)}
     out = []
     for n, ins in enumerate(insns):
         m = ins.mnemonic
         if ins.address not in reached or m == DATA_MNEMONIC: out.append(([], False)); continue
-        tg = sorted(cases) if m == "br" else [ins.operands[-1].imm] if (m in BRANCH_IMM or m.startswith(("b.", "bc."))) \
+        tg = [insns[shared[n]].address] if shared and n in shared else sorted(cases) if m == "br" \
+            else [ins.operands[-1].imm] if (m in BRANCH_IMM or m.startswith(("b.", "bc."))) \
             and ins.operands and ins.operands[-1].type == ARM64_OP_IMM else []
         nxt = [n + 1] if m not in NO_FALL and n + 1 < len(insns) else []
         out.append(([at[t] for t in tg if t in at and t in reached] + nxt, m in ("bl", "blr")))
@@ -1357,8 +1400,8 @@ def lift_function(insns: list, fstarts: set, cname: str, resume: list | None = N
 def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None = None,
                     read: object = None, inside: bool = True, regs: bool = True, stubs: dict | None = None,
                     ic: bool = False, msg: dict | None = None, abi: bool = False,
-                    noret: frozenset = frozenset()) -> tuple[str, list, set, str, dict | None]:
-    """Lift a whole function -> (c_source, unsupported_list, call_targets, kind, flag_facts: where NZCV values cross calls, returns and entries, None when unknown); with `resume` it takes int gd_entry. Only words reached from the entry and resume points are lifted; read(vmaddr, n) -> bytes decodes jump tables; inside=False is the caller's proof that no code pointer into this function's interior exists (see reach); regs keeps guest registers in C locals (localize); ic: indirect calls and calls/tail calls into import stubs (stubs: stub vmaddr -> GOT vmaddr) go through a per-site inline cache (GD_ICALL) instead of dispatch / extern_stub; msg (GOT vmaddr -> objc_msgSend family member, with ic): calls through those GOT words (import stubs, objc_msgSend$sel stubs' ldr/br) get a per-site send cache (GD_MSGSEND); abi: localize's (the AAPCS64 register contract; each direct, stub and GOT-loaded call or tail call is a localize site); noret: function starts that never return (abi_check)."""
+                    noret: frozenset = frozenset(), refs: list | None = None) -> tuple[str, list, set, str, dict | None]:
+    """Lift a whole function -> (c_source, unsupported_list, call_targets, kind, flag_facts: where NZCV values cross calls, returns and entries, None when unknown); with `resume` it takes int gd_entry. Only words reached from the entry and resume points are lifted; read(vmaddr, n) -> bytes decodes jump tables (read(vmaddr, n, True) -> relocated 8-byte words, label tables); inside=False is the caller's proof that no code pointer into this function's interior exists (see reach); regs keeps guest registers in C locals (localize); ic: indirect calls and calls/tail calls into import stubs (stubs: stub vmaddr -> GOT vmaddr) go through a per-site inline cache (GD_ICALL) instead of dispatch / extern_stub; msg (GOT vmaddr -> objc_msgSend family member, with ic): calls through those GOT words (import stubs, objc_msgSend$sel stubs' ldr/br) get a per-site send cache (GD_MSGSEND); abi: localize's (the AAPCS64 register contract; each direct, stub and GOT-loaded call or tail call is a localize site); noret: function starts that never return (abi_check); refs: the [lo, hi) ranges a code pointer may hold that meet this function (gdyld pointer_refs): a label table's word may be rewritten to one (see reach), so its exact ones are br targets and gd_ijump cases, and a label table's case goes to its label only while the word still holds it."""
     msg = msg if ic and msg else {}
     body = []                                                          # (instruction index or -1, C text)
     unsupported = []
@@ -1370,13 +1413,17 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
     gots = stubs if ic and stubs else {}
     sites = {}                                                         # localize sites
     icall = "GD_ICALL(_t);" if ic else "dispatch(c, _t);"
-    reached, brs, fallback = reach(insns, [insns[0].address] + list(resume or []), read, inside)
+    reached, brs, fallback = reach(insns, [insns[0].address] + list(resume or []), read, inside, refs)
     joins = jump_edges(insns) | set(resume or []) | {t for _k, ts in brs.values() for t in ts}   # where another path may enter
     fz, fused = None, False                                            # flag_capture state reaching this instruction on its one path
     pos = {ins.address: n for n, ins in enumerate(insns)}
-    jtab = {} if fallback else {jl: (pos[a], tg) for a, (kd, tg) in brs.items() if kd == "table"
+    jtab = {} if fallback else {jl: (pos[a], tg) for a, (kd, tg) in brs.items() if kd in ("table", "label")
                                  for jl in [table_load(insns, pos[a], joins)] if jl is not None}   # table load -> (its br, targets)
     jbr = {kb: tg for kb, tg in jtab.values()}
+    first = {}                                                         # a threaded interpreter's computed gotos: every handler's br over one table
+    for kb in sorted(jbr): first.setdefault((tuple(jbr[kb]), insns[kb].op_str), kb)
+    shared = {kb: first[(tuple(tg), insns[kb].op_str)] for kb, tg in jbr.items() if first[(tuple(tg), insns[kb].op_str)] != kb}   # br -> the first br
+                                                                       # with its targets and register: one switch, not a label's phis per br
     for n, ins in enumerate(insns):
         if ins.address not in reached:                                 # never reached by control flow: data, not lifted
             if n == 0 or insns[n - 1].address in reached:
@@ -1436,14 +1483,18 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
                 if g is not None: sites[n] = ("g", g)
                 body.append((n, "  { uint64_t _t = %s; c->X[30] = 0x%xULL + GUEST_BASE; %s%s } GD_RC(0x%xULL)%s" % (
                     rd(k, i, 64), ins.address + 4, SPILL, icall if mk is None else icall_of(mk), ins.address + 4, RELOAD)))
+            elif n in shared:                                          # gd_jx and the register hold what the first br switches on
+                body.append((n, "  goto L_%x;" % insns[shared[n]].address))
             elif bm == "br":                                           # inside the function: jump table; else tail call
                 has_indirect = True; ijump = True
                 k, i, w = reg_parts(ins.reg_name(ins.operands[0].reg))
                 g = got_load(insns, n, xname(ins.reg_name(ins.operands[0].reg)), joins)
                 mk = msg.get(g) if msg else None
                 if g is not None: sites[n] = ("g", g)
+                chk = n in jbr and brs[ins.address][0] == "label"                                                       # a word that may be rewritten: its label while it holds it
+                arm = "case %d: if (_t == 0x%xULL + GUEST_BASE) goto L_%x ; break;" if chk else "case %d: goto L_%x ;"  # else gd_ijump
                 dense = "" if n not in jbr else " switch (gd_jx) { %s default: break; }" % " ".join(
-                    "case %d: goto L_%x ;" % (j, t) for j, t in enumerate(jbr[n]))   # spaced: not a place_edge_spills edge
+                    arm % ((j, t, t) if chk else (j, t)) for j, t in enumerate(jbr[n]))                                 # spaced: not a place_edge_spills edge
                 body.append((n, "  { uint64_t _t = %s;%s if (_t - (0x%xULL + GUEST_BASE) < 0x%xULL) { gd_t = _t - GUEST_BASE; goto gd_ijump; }"
                                 " %s%s %s }" % (rd(k, i, 64), dense, insns[0].address, insns[-1].address + 4 - insns[0].address, SPILL,
                                                 icall if mk is None else icall_of(mk), TAIL)))
@@ -1468,13 +1519,14 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
         body.append((-1, "gd_ijump: switch (gd_t) {\n%s\n  default: %sdispatch(c, gd_t + GUEST_BASE); %s }" % ("\n".join(
             "  case 0x%xULL: goto L_%x;" % (a, a) for a in sorted(cases)), SPILL, TAIL)))
     at = {i.address: n for n, i in enumerate(insns)}
-    edges = flow_edges(insns, reached, cases)
+    edges = flow_edges(insns, reached, cases, shared)
     heads = loop_heads(edges, insns, addrs, fstarts)
     body = [(n, t + " GD_LOOP;" if n in heads and t == "L_%x:" % insns[n].address else t) for n, t in body]
     blind = frozenset(n for n, i in enumerate(insns) if i.mnemonic == "br") if fallback else frozenset()   # br edges to every word
     regs = regs and len(cases) <= HUGE_SWITCH                          # a huge every-word switch: phis per local per label stall clang
     text, decl, facts = localize(body, edges, [0] + [at[a] for a in resume or [] if a in at], regs, insns, fstarts, blind, abi, noret,
-                                 None if fallback else {at[a]: [at[t] for t in ts if t in at] for a, (_k, ts) in brs.items() if a in at}, sites)
+                                 None if fallback else {at[a]: [shared[at[a]]] if at[a] in shared else
+                                                        [at[t] for t in ts if t in at] for a, (_k, ts) in brs.items() if a in at}, sites)
     mark = "  " + UNDECODED_MARK + "\n" if fallback else ""           # gdyld's build report names these functions
     if resume:
         bad = [hex(a) for a in resume if a not in addrs]
