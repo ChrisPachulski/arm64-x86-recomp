@@ -31,6 +31,7 @@ RUNTIME_LOAD = {"/usr/lib/libunwind.1.dylib": 0x400000000, "/usr/lib/libc++abi.1
 LIBSYSTEM, LIBUNWIND = "/usr/lib/libSystem.B.dylib", "/usr/lib/libunwind.1.dylib"   # libSystem re-exports the unwinder
 INTRINSICS = {LIBUNWIND: {"___libunwind_Registers_arm64_jumpto": "gd_jumpto"}}      # image id -> {local symbol: host function}
 SETJMP = {"_setjmp", "__setjmp", "_sigsetjmp"}                         # their return sites become resume points
+FULL_SPILL = {"___chkstk_darwin"}                                      # host routines reading past the arguments (sp_chkstk: x9): GDA_G_
 MSG_SENDS = {"_objc_msgSend": 0, "_objc_msgSendSuper": 1, "_objc_msgSendSuper2": 2}   # recompile GD_MSGSEND kinds (gobjc send's sup)
 CHUNK_INSNS = 6000                                                     # instructions per compiled C chunk (bounds clang RSS)
 FUNC_RE = re.compile(r"\bfunc_([0-9a-f]+)\b")                          # a lifted function's C name in chunk source
@@ -537,7 +538,7 @@ def interposes(images: list) -> tuple[dict, dict]:
     return generic, specific
 
 def link(images: list) -> tuple[list, list, list]:
-    """Flat images with rebases + guest binds applied; host binds [(abs, name, addend, weak)]; resolution report lines. The last bind to an address wins (weak binds come last), as when dyld applies them in order."""
+    """Flat images with rebases + guest binds applied; host binds [(abs, name, addend, weak)]; resolution report lines. The last bind to an address wins (weak binds come last), as when dyld applies them in order. Each image gets img["gbinds"]: bind vmaddr -> the absolute guest address it holds (abi_plan)."""
     flats, host_binds, report = [], [], []
     generic, specific = interposes(images)
     for i, img in enumerate(images):
@@ -553,6 +554,7 @@ def link(images: list) -> tuple[list, list, list]:
             if r is None and not weak:
                 raise LookupError("%s: symbol %s (ordinal %d) not found" % (os.path.basename(img["path"]), name, ordv))
             final[a] = (r, name, add, weak)
+        img["gbinds"] = {a: r[1] + add for a, (r, _n, add, _w) in final.items() if r is not None and r[0] == "guest"}
         for a, (r, name, add, weak) in final.items():
             if r is None: struct.pack_into("<Q", flat, a - img["vm_base"], 0)
             elif r[0] == "guest": struct.pack_into("<Q", flat, a - img["vm_base"], (r[1] + add) & (2 ** 64 - 1))
@@ -795,11 +797,76 @@ def interior_pointers(img: dict, fset: set | None = None, refs: list | None = No
     return sorted(out)
 
 def decoded_lift(read: object, ptrs: list, gots: dict, insns: list, fstarts: set, cname: str, resume: list | None = None,
-                 msg: dict | None = None) -> tuple:
-    """R.lift_function with the jump-table reader, the per-function proof that no code pointer lands in its interior, and inline-cached indirect and import-stub calls (gots: stub vmaddr -> GOT vmaddr; msg: GOT vmaddr -> objc_msgSend family member, msg_gots)."""
+                 msg: dict | None = None, abi: bool = False, noret: frozenset = frozenset()) -> tuple:
+    """R.lift_function with the jump-table reader, the per-function proof that no code pointer lands in its interior, and inline-cached indirect and import-stub calls (gots: stub vmaddr -> GOT vmaddr; msg: GOT vmaddr -> objc_msgSend family member, msg_gots; abi: not abi_ok; noret: noreturn_starts)."""
     k = bisect.bisect_right(ptrs, insns[0].address)
     inside = k < len(ptrs) and ptrs[k] < insns[-1].address + insns[-1].size
-    return R.lift_function_x(insns, fstarts, cname, resume, read, inside, stubs=gots, ic=True, msg=msg)
+    return R.lift_function_x(insns, fstarts, cname, resume, read, inside, stubs=gots, ic=True, msg=msg, abi=abi, noret=noret)
+
+def abi_ok(img: dict) -> str:
+    """Why the image's code may not run under the AAPCS64 register contract (recompile localize abi), before its lift: it links a Swift library (Swift returns errors in x21 and passes self and async contexts in x20 and x22, registers C keeps across calls) or GDYLD_ABI=0; else ''."""
+    if os.environ.get("GDYLD_ABI") == "0": return "GDYLD_ABI=0"
+    return "links Swift" if any("/libswift" in name for name, _kind in img["deps"]) else ""
+
+def noreturn_starts(img: dict) -> frozenset:
+    """Function starts whose words hold no way back to a caller: no ret or br (any key) and no b, b.cond, cbz/cbnz or tbz/tbnz out of the function; a word of data that decodes as one only makes the function count as returning. The word after a bl to one is another path's code (recompile abi_check)."""
+    out = []
+    for addr, size, off in code_sections(img):
+        starts = sorted(a for a in img["fstarts"] if addr <= a < addr + size)
+        for lo, hi in zip(starts, starts[1:] + [addr + size]):
+            back = False
+            for pc in range(lo, hi - 3, 4):
+                w = int.from_bytes(img["data"][off + pc - addr:off + pc - addr + 4], "little")
+                if w & 0xFE000000 == 0xD6000000 and (w >> 21) & 0xF in (0, 2): back = True; break   # br / ret (and their pointer-auth forms)
+                d = (w & 0x3FFFFFF) << 2 if w & 0xFC000000 == 0x14000000 else (w >> 5 & 0x7FFFF) << 2 if w & 0xFF000010 == 0x54000000 \
+                    or w & 0x7E000000 == 0x34000000 else (w >> 5 & 0x3FFF) << 2 if w & 0x7E000000 == 0x36000000 else None
+                if d is None: continue
+                bits = 28 if w & 0xFC000000 == 0x14000000 else 21 if w & 0x7E000000 != 0x36000000 else 16
+                t = pc + (d - (1 << bits) if d >> (bits - 1) & 1 else d)
+                if not lo <= t < hi: back = True; break
+            if not back: out.append(lo)
+    return frozenset(out)
+
+def abi_returns(rows: list, late: set) -> set:
+    """Function starts whose returns and tail calls keep every store under GD_ABI: the direct callees some caller reads past the results of (recompile abi_check), closed over direct tail calls (an indirect or stub tail call stores everything there too, and neither host code nor a function under the contract changes the registers it does not return), from the image's flag rows ([(addresses defined, flag_facts)])."""
+    tails = {ads[0]: fc.get("tails", ()) for ads, fc in rows if fc}
+    out, work = set(), sorted(late)
+    while work:
+        f = work.pop()
+        if f not in out: out.add(f); work += sorted(tails.get(f, ()))
+    return out
+
+def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set]]:
+    """Per image (why its code keeps full register sync, else ''; GDA_X_ callees; GDA_G_ GOT slots; GDA_RET_ functions). A function breaks the AAPCS64 register contract when it reads registers no call passes (its entry's, and a callee's that may reach the call unchanged) or leaves callee-saved registers changed (its own writes before any save, and a callee's it saved nothing over), closed over the direct calls and tail calls of each image and the stub and GOT calls between images (recompile abi_check facts; a GOT bound into guest code calls that function). A GOT call passes on only what its callee leaves changed: an export that reads registers no call passes has a convention of its own (sp_chkstk's x9) or captures its caller's registers (the unwinder's unw_getcontext), which the site honours by storing everything (GDA_G_) and which its own image's callers cannot see (an export is address_taken). Calls into one store and reload every register, and its returns store every register, as do those of the direct callees some caller reads past the results of (abi_returns). An image keeps full sync when one of its own is reached through a pointer or an export (address_taken: an indirect call cannot tell), or when abi_ok says so. The GOT slots bound to FULL_SPILL host routines are GDA_G_ too."""
+    at = lambda k, a: a - images[k]["vm_base"] + images[k]["load"]     # absolute guest address
+    fns = {at(k, a): (k, a, f) for k, li in enumerate(lifts) for a, f in li["abi_fn"].items()}
+    ins, outs = {g: f[0] for g, (_k, _a, f) in fns.items()}, {g: f[1] for g, (_k, _a, f) in fns.items()}
+    calls = {g: [(at(k, r[1]), e, s) if r[0] == "d" else (images[k]["gbinds"].get(r[1]), 0, s) for r, e, s in f[2]] for g, (k, _a, f) in fns.items()}
+    users = {}
+    for g, cs in calls.items():
+        for t, _e, _s in cs: users.setdefault(t, []).append(g)
+    work = list(fns)
+    while work:
+        g = work.pop()
+        i, o = ins[g], outs[g]
+        for t, e, s in calls[g]:
+            if t in ins: i |= ins[t] & e; o |= outs[t] & ~s
+        if (i, o) != (ins[g], outs[g]): ins[g], outs[g] = i, o; work += users.get(g, [])
+    plan = []
+    for k, (img, li) in enumerate(zip(images, lifts)):
+        bad = {a for g, (j, a, _f) in fns.items() if j == k and (ins[g] or outs[g])}
+        say = lambda a: "0x%x %s" % (a, " and ".join(p for p in ("reads %s at entry" % R.reg_names(ins[at(k, a)]) if ins[at(k, a)] else "",
+                                                               "leaves %s changed" % R.reg_names(outs[at(k, a)]) if outs[at(k, a)] else "") if p))
+        taken = sorted(bad & li["abi_taken"])
+        why = abi_ok(img) or ("%s, and a pointer or an export reaches it%s" % (say(taken[0]), " (%d more)" % (len(taken) - 1) if len(taken) > 1 else "")
+                              if taken else "")
+        xg = {s for s, t in img["gbinds"].items() if t in fns and fns[t][2][0] & R.ABI_NOT_IN or outs.get(t)} | full_gots(img)
+        plan.append((why, bad, xg, abi_returns(li["flags"], li["abi_late"] | {a for a in bad if outs[at(k, a)]})))
+    return plan
+
+def full_gots(img: dict) -> frozenset:
+    """GOT vmaddrs bound to FULL_SPILL imports."""
+    return frozenset(a for a, _o, n, _w, _ad in img["binds"] if n in FULL_SPILL)
 
 def msg_gots(img: dict) -> dict[int, int]:
     """GOT vmaddr -> MSG_SENDS index for the image's words bound to objc_msgSend, objc_msgSendSuper or objc_msgSendSuper2."""
@@ -933,12 +1000,13 @@ def write_chunk(out_dir: str, k: int, j: int, text: str, addrs: list) -> list[tu
     return [(path, j, addrs)]
 
 def write_chunks(out_dir: str, k: int, sources: object, emit: object) -> tuple[list, dict]:
-    """Stream function_sources tuples into chunk files of CHUNK_INSNS instructions as they fill (one chunk in memory), each with its C++ wrapper unit image<k>_<j>_eh.cpp when it has resumable functions; emit(index, sources, addresses) -> chunk text, '' for no file. Returns ([(path, index, addresses)], {'unsupported', 'instructions', 'resumable', 'flags': [(addresses defined, flag facts)] of every function with a non-empty or unknown flag_facts, 'eh_units': wrapper unit paths})."""
+    """Stream function_sources tuples into chunk files of CHUNK_INSNS instructions as they fill (one chunk in memory), each with its C++ wrapper unit image<k>_<j>_eh.cpp when it has resumable functions; emit(index, sources, addresses) -> chunk text, '' for no file. Returns ([(path, index, addresses)], {'unsupported', 'instructions', 'resumable', 'flags': [(addresses defined, flag facts)] of every function with a non-empty or unknown flag_facts, 'eh_units': wrapper unit paths, 'abi_fn': {function start: recompile abi_check facts}, 'abi_late': direct callees whose callers read registers past their results})."""
     out, cur, addrs, ehs, n, j = [], [], [], [], 0, 0
-    tot = {"unsupported": [], "instructions": 0, "resumable": 0, "flags": [], "eh_units": []}
+    tot = {"unsupported": [], "instructions": 0, "resumable": 0, "flags": [], "eh_units": [], "abi_fn": {}, "abi_late": set()}
     for ads, src, ni, uns, res, fc, eh in sources:
         cur.append(src); addrs += ads; n += ni; ehs += [eh] if eh else []
         tot["unsupported"] += uns; tot["instructions"] += ni; tot["resumable"] += res
+        if fc and "abi_fn" in fc: tot["abi_fn"][ads[0]] = fc.pop("abi_fn"); tot["abi_late"] |= set(fc.pop("abi_late"))
         if fc is None or any(fc.values()): tot["flags"].append((ads, fc))   # absent: no NZCV use crosses anything
         if n >= CHUNK_INSNS:
             out += write_chunk(out_dir, k, j, emit(j, cur, addrs), addrs); tot["eh_units"] += write_eh(out_dir, k, j, ehs)
@@ -1056,7 +1124,8 @@ def lift_prep(img: dict) -> dict:
     refs = pointer_refs(img)
     ptrs = interior_pointers(img, refs=refs)
     ents = interior_entries(img, bounds, eh_resume_points(img, bounds), setjmp_stubs(img), ptrs)
-    return {"refs": refs, "ents": ents, "lift": functools.partial(decoded_lift, functools.partial(read_vm, img), ptrs, stub_gots(img), msg=msg_gots(img))}
+    return {"refs": refs, "ents": ents, "lift": functools.partial(decoded_lift, functools.partial(read_vm, img), ptrs, stub_gots(img), msg=msg_gots(img),
+                                     abi=not abi_ok(img), noret=noreturn_starts(img) if not abi_ok(img) else frozenset())}
 
 def lift_finish(img: dict, k: int, out_dir: str, pre: dict, chunks: list, tot: dict, host_gots: frozenset) -> dict:
     """lift_image's result from the written chunks ([(path, index, addresses)]) and their totals: writes image<k>_t.c."""
@@ -1066,7 +1135,7 @@ def lift_finish(img: dict, k: int, out_dir: str, pre: dict, chunks: list, tot: d
     extra = frozenset(e for es in ents.values() for e in es)
     flagged = {ads[0] for ads, _fc in tot["flags"]} | extra
     return {**tot, "units": [p for p, _j, _a in chunks] + tot["eh_units"] + [tail], "entries": sum(len(e) for e in ents.values()),
-            "flag_readers_taken": sorted(address_taken(img, refs, flagged)), "flag_extra": extra,
+            "flag_readers_taken": sorted(address_taken(img, refs, flagged)), "flag_extra": extra, "abi_taken": address_taken(img, refs, set(tot["abi_fn"])),
             "flag_host": frozenset(s for s, g in stub_gots(img).items() if g in host_gots)}
 
 ###############
@@ -1087,13 +1156,14 @@ def lift_chunk(img: dict, k: int, out_dir: str, pre: dict, sc: dict, j: int, rec
     """Chunk j of image k from its function records (function_plan): writes it and its C++ wrapper unit as write_chunks would; ([(path, j, addresses)] or [], totals as write_chunks')."""
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True; md.skipdata = True   # macho.iter_functions' decoder
     cur, addrs, ehs = [], [], []
-    tot = {"unsupported": [], "instructions": 0, "resumable": 0, "flags": [], "eh_units": []}
+    tot = {"unsupported": [], "instructions": 0, "resumable": 0, "flags": [], "eh_units": [], "abi_fn": {}, "abi_late": set()}
     for s, e, o in recs:
         insns = list(md.disasm(img["data"][o:o + e - s], s))
         if len(insns) != (e - s) // 4: raise ValueError("%s: function 0x%x decoded to %d items, planned %d" % (img["path"], s, len(insns), (e - s) // 4))
         ads, src, ni, uns, res, fc, eh = function_source(img, k, pre["lift"], pre["ents"], CHUNK_CXX, sc, s, insns)
         cur.append(src); addrs += ads; ehs += [eh] if eh else []
         tot["unsupported"] += uns; tot["instructions"] += ni; tot["resumable"] += res
+        if fc and "abi_fn" in fc: tot["abi_fn"][ads[0]] = fc.pop("abi_fn"); tot["abi_late"] |= set(fc.pop("abi_late"))
         if fc is None or any(fc.values()): tot["flags"].append((ads, fc))   # absent: no NZCV use crosses anything
     tot["eh_units"] += write_eh(out_dir, k, j, ehs)
     return write_chunk(out_dir, k, j, chunk_text(img, k, j, cur, addrs, cxx=CHUNK_CXX), addrs), tot
@@ -1102,7 +1172,8 @@ def merge_totals(parts: list[dict]) -> dict:
     """write_chunks' totals from per-chunk totals, in chunk order."""
     return {"unsupported": [u for p in parts for u in p["unsupported"]], "instructions": sum(p["instructions"] for p in parts),
             "resumable": sum(p["resumable"] for p in parts), "flags": [f for p in parts for f in p["flags"]],
-            "eh_units": [u for p in parts for u in p["eh_units"]]}
+            "eh_units": [u for p in parts for u in p["eh_units"]], "abi_fn": {a: f for p in parts for a, f in p["abi_fn"].items()},
+            "abi_late": {a for p in parts for a in p["abi_late"]}}
 
 def lift_task(ctx: dict, task: tuple[int, int, int]) -> tuple[list, list, int, int]:
     """Worker: chunks [j0, j1) of image k -> (chunk rows, per-chunk totals, pid, this worker's peak RSS bytes)."""
@@ -1185,11 +1256,14 @@ def flag_plan(rows: list, taken: list, extra: frozenset = frozenset(), mode: str
             work += flag_needs(f, fc["ret"], owner, extra, mode, host) + [("T", owner.get(t, t)) for t in fc["tails"]]
     return False, r_set, t_set, ""
 
-def flags_header(everywhere: bool, readers: set, returners: set, msg_slots: dict | None = None) -> str:
-    """gd_flags_<k>.h text (passed with -include to the image's chunks): GD_FLAGS_ALL and the GDF_IN_ / GDF_RET_ names recompile.flag_wrap tests, and GD_MSG_SLOT<k> (msg_slots: MSG_SENDS index -> its import slot address; recompile GD_MSGSEND)."""
+def flags_header(everywhere: bool, readers: set, returners: set, msg_slots: dict | None = None, abi: bool = False,
+                 rets: set = frozenset(), xd: set = frozenset(), xg: set = frozenset()) -> str:
+    """gd_flags_<k>.h text (passed with -include to the image's chunks): GD_FLAGS_ALL and the GDF_IN_ / GDF_RET_ names recompile.flag_wrap tests, GD_MSG_SLOT<k> (msg_slots: MSG_SENDS index -> its import slot address; recompile GD_MSGSEND) GD_ABI (abi: the image runs under the AAPCS64 register contract, recompile localize) and the GDA_RET_, GDA_X_ and GDA_G_ names (rets, xd, xg: abi_plan)."""
     slots = [] if not msg_slots else ["#define GD_MSG_SLOT%d 0x%xULL\n" % (k, (msg_slots or {}).get(k, 1)) for k in range(3)]
-    return "".join(["/* generated by gdyld.py: NZCV stores at calls and returns (recompile.flag_wrap) */\n#define GD_FLAGS_ALL %d\n" % int(everywhere)]
-                   + ["#define GDF_IN_%x 1\n" % a for a in sorted(readers)] + ["#define GDF_RET_%x 1\n" % a for a in sorted(returners)] + slots)
+    return "".join(["/* generated by gdyld.py: NZCV stores at calls and returns (recompile.flag_wrap) */\n#define GD_FLAGS_ALL %d\n#define GD_ABI %d\n" % (int(everywhere), int(abi))]
+                   + ["#define GDF_IN_%x 1\n" % a for a in sorted(readers)] + ["#define GDF_RET_%x 1\n" % a for a in sorted(returners)] + slots
+                   + ["#define GDA_RET_%x 1\n" % a for a in sorted(rets)] + ["#define GDA_X_%x 1\n" % a for a in sorted(xd)]
+                   + ["#define GDA_G_%x 1\n" % a for a in sorted(xg)])
 
 def dispatch_text(images: list, nimp: int, leaf: frozenset = frozenset()) -> str:
     """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache: a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called; anything else goes to dispatch()."""
@@ -1712,9 +1786,13 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     t_lift = time.time()
     lifts, lstats = lift_images(images, out_dir, [host_gots_of(img, host_binds) for img in images])
     report.append("lift: %.0f s, %s" % (time.time() - t_lift, lstats))
-    for k, (img, li) in enumerate(zip(images, lifts)):
+    for k, (img, li, (why, xd, xg, rets)) in enumerate(zip(images, lifts, abi_plan(images, lifts))):
         units += li["units"]; ninsn += li["instructions"]; nres += li["resumable"]
-        plans.append((li["units"], flag_plan(li["flags"], li["flag_readers_taken"], li["flag_extra"], host=li["flag_host"])))
+        plans.append((li["units"], flag_plan(li["flags"], li["flag_readers_taken"], li["flag_extra"], host=li["flag_host"]), (not why, rets, xd, xg)))
+        report.append("register contract %s: %s" % (os.path.basename(img["path"]), "full sync at every call (%s)" % why if why else
+                                                     "AAPCS64 (callee-saved registers stay in locals; calls store arguments, returns results; "
+                                                     "full stores at calls into %d functions and %d import slots outside the contract, full returns "
+                                                     "from %d)" % (len(xd), len(xg), len(rets))))
         unsupported += [(os.path.basename(img["path"]), hex(u[0]), u[1]) for u in li["unsupported"]]
         report.append("lift %s: %d instructions, %d chunks, %d extra entry points, NZCV: %s, peak RSS %d MB" % (
             os.path.basename(img["path"]), li["instructions"], len(li["units"]), li["entries"],
@@ -1725,11 +1803,11 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
             report.append("WARNING: %s: %d function%s with an undecoded br run slower (every instruction a branch target, state in "
                           "memory): %s" % (os.path.basename(img["path"]), len(slow), "" if len(slow) == 1 else "s",
                                            ", ".join(shown[:8]) + (", ..." if len(shown) > 8 else "")))
-    everywhere, unit_flags = any(p[0] for _u, p in plans), {}
+    everywhere, unit_flags = any(p[0] for _u, p, _a in plans), {}
     msg_slots = {MSG_SENDS[n[1]]: IMPORT_BASE + j * IMP_SLOT for j, n in enumerate(names) if n[1] in MSG_SENDS}   # the slots gbridge binds them to
-    for k, (us, (_e, readers, returners, _why)) in enumerate(plans):
+    for k, (us, (_e, readers, returners, _why), (abi, rets, xd, xg)) in enumerate(plans):
         hdr = os.path.abspath(os.path.join(out_dir, "gd_flags_%d.h" % k))
-        text = flags_header(everywhere, set() if everywhere else readers, set() if everywhere else returners, msg_slots)
+        text = flags_header(everywhere, set() if everywhere else readers, set() if everywhere else returners, msg_slots, abi, rets, xd, xg)
         open(hdr, "w").write(text)
         unit_flags.update({u: ["-include", hdr, "-DGDF_H=%s" % hashlib.sha256(text.encode()).hexdigest()[:16]] for u in us if u.endswith((".c", ".cc"))})
     report.append("NZCV stores at calls and returns: %s" % ("everywhere" if everywhere else "only into flag-reading callees and out of flag-returning ones"))

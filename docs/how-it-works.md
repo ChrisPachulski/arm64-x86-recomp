@@ -48,6 +48,15 @@ The lift runs in forked worker processes when more than one lift job is allowed 
 An instruction with no lifter case is listed in the result and replaced by a call that stops the program if it runs; [lifter.md](lifter.md) shows how to add one.
 `gdyld` then works out where the NZCV flags must be stored at calls and returns, and writes that plan to `gd_flags_<k>.h`.
 
+Calls between lifted functions follow the AAPCS64 register contract wherever `gdyld` can show the code keeps it.
+A call then stores to the CPU struct only what a callee may read (x0-x8, x16, x17, fp, lr, sp, v0-v7 and the flags), a return stores the results (x0, x1, fp, sp and v0-v3), and after a call only x0, x1, v0-v3 and the flags are read back; the callee-saved registers x19-x28 and v8-v15 stay in C locals across the call.
+Machine-outlined code and hand-written assembly can break the contract, so the lifter records, for every function, the registers past the arguments it reads at entry and the callee-saved registers it leaves changed; a register its own prologue saved counts as the function's.
+`gdyld` closes those facts over the direct calls in each image and the calls between images. A call into a function that breaks the contract stores and reloads every register, and that function's returns store every register.
+A call after which the caller reads a register the call may have changed gets the same treatment.
+An image keeps full register sync at every call when one of its functions that breaks the contract can be reached through a pointer or an export (an indirect call cannot tell), when it links a Swift library (Swift passes self, errors and async contexts in x20, x21 and x22), or when `GDYLD_ABI=0` is set.
+Functions with resume points also keep every store and reload, so the C++ unwinder and `longjmp` find callee-saved registers in the CPU struct.
+The translation report has one `register contract` line per image.
+
 ## 5. Build
 
 The output directory also receives these generated files:
