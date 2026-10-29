@@ -379,11 +379,13 @@ def compile_ir(src: str, arch: str, sdk: str) -> tuple[str | None, str]:
     out, path = os.path.join(CACHE, key + ".ll"), os.path.join(CACHE, key + ".swift")
     if os.path.isfile(out): return open(out).read(), ""
     if os.path.isfile(out + ".err"): return None, open(out + ".err").read()
-    open(path, "w").write(src)
-    r = subprocess.run(["xcrun", "swiftc", "-target", gswift.TARGET % arch, "-sdk", sdk, "-emit-ir"] + gswift.swiftc_flags(path) + [path, "-o", out + ".tmp"],
+    tmp = ".%d.tmp" % os.getpid()                              # per process: parallel beds share this cache
+    open(path + tmp, "w").write(src)
+    os.replace(path + tmp, path)                               # never truncated under another process's swiftc
+    r = subprocess.run(["xcrun", "swiftc", "-target", gswift.TARGET % arch, "-sdk", sdk, "-emit-ir"] + gswift.swiftc_flags(path) + [path, "-o", out + tmp],
                        capture_output=True, text=True, timeout=600)
     if r.returncode: open(out + ".err", "w").write(r.stderr); return None, r.stderr
-    os.replace(out + ".tmp", out)
+    os.replace(out + tmp, out)
     return open(out).read(), ""
 
 def learn(err: str, st: dict) -> dict | None:

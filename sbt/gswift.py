@@ -161,10 +161,11 @@ def emit_ir(src: str, arch: str, sdk: str) -> str:
     key = hashlib.sha256((open(src).read() + arch + sdk).encode()).hexdigest()[:20]
     out = os.path.join(IR_CACHE, "%s.%s.%s.ll" % (os.path.basename(src)[:-6], arch, key))
     if not os.path.isfile(out):
-        r = subprocess.run(["xcrun", "swiftc", "-O", "-target", TARGET % arch, "-sdk", sdk, "-emit-ir"] + swiftc_flags(src) + [src, "-o", out + ".tmp"],
+        tmp = out + ".%d.tmp" % os.getpid()                     # per process: parallel beds share this cache
+        r = subprocess.run(["xcrun", "swiftc", "-O", "-target", TARGET % arch, "-sdk", sdk, "-emit-ir"] + swiftc_flags(src) + [src, "-o", tmp],
                            capture_output=True, text=True, timeout=900)
         if r.returncode: raise RuntimeError("swiftc -emit-ir %s %s: %s" % (src, arch, r.stderr[-1500:]))
-        os.replace(out + ".tmp", out)
+        os.replace(tmp, out)
     return open(out).read()
 
 def source_sigs(src: str, sdk: str) -> tuple[dict, dict, dict, list]:
