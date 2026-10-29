@@ -1099,6 +1099,10 @@ template<class T> void hold_s(HoldS<T>& h, Rd& r) {
   if (!h.v) return;
   const CodeLay& L = code_lay<Q>();
   uint64_t p = to_u64(h.v);
+  if constexpr (__is_same(Q, malloc_zone_t)) {                /* libmalloc's default zone (SQLite's malloc_zone_malloc): host */
+    static const uint64_t def = to_u64(malloc_default_zone());   /* slots only, nothing to shadow */
+    if (p == def) return;
+  }
   bool need = false;
   for (int i = 0; i < L.n; i++) {
     uint64_t x = rd8((const char*)(uintptr_t)p + L.f[i].off);
@@ -1253,8 +1257,12 @@ static void nslot_add(uint64_t fn, const NSlot* s, bool keep = false) {
    calls them through a zone pointer the host gave it (SQLite's mem1: malloc_default_zone()->size). The first call through a
    slot of a live zone bridges every slot that zone's version has; one function in two slots keeps its first bridge. */
 struct ZSlot { size_t off; unsigned ver; NSlot s; };
+template<class T> struct ZArg { using t = T; };
+template<> struct ZArg<malloc_zone_t*> { using t = void*; };  /* the zone: a live host zone (zone_bridge), passed as is, its */
+template<class F> struct ZOp;                                 /* slots not scanned for guest code at every call (hold_s) */
+template<class R, class... A> struct ZOp<R (*)(A...)> { using t = R (*)(typename ZArg<A>::t...); };
 #define GD_ZSLOT(f, v) {offsetof(malloc_zone_t, f), v, \
-                        {nullptr, nullptr, 0, 0, 0, nullptr, &Inv<decltype(malloc_zone_t::f)>::call_rt, "malloc_zone_t::" #f}}
+                        {nullptr, nullptr, 0, 0, 0, nullptr, &Inv<typename ZOp<decltype(malloc_zone_t::f)>::t>::call_rt, "malloc_zone_t::" #f}}
 static const ZSlot ZSLOTS[] = {
   GD_ZSLOT(size, 0), GD_ZSLOT(malloc, 0), GD_ZSLOT(calloc, 0), GD_ZSLOT(valloc, 0), GD_ZSLOT(free, 0), GD_ZSLOT(realloc, 0),
   GD_ZSLOT(destroy, 0), GD_ZSLOT(batch_malloc, 0), GD_ZSLOT(batch_free, 0), GD_ZSLOT(memalign, 5),
@@ -1940,11 +1948,12 @@ static void gd_trace_dump() { gd_trace_dump_as("import-trace"); }
 /* GDYLD_STOP_AT_IMPORT=name[,name...] (a runner option, unset by default): a guest call of a named import stops loudly before
    the host call happens, whichever route reaches it (direct, inline cache, dispatch, a dlsym'd pointer, objc_msgSend) */
 static unsigned char* gd_stop;
+extern "C" { int gd_imp_slow; }                               /* recompile GD_LEAF: set while a diagnostic must see every import call */
 [[noreturn]] static void gd_stop_at(int k) {
   die_name("GDYLD_STOP_AT_IMPORT: the guest called this import; stopped before the host call", ENT[k].name);
 }
 static void gd_stop_arm(const char* list) {
-  gd_stop = (unsigned char*)calloc((size_t)NIMP + 1, 1);
+  gd_stop = (unsigned char*)calloc((size_t)NIMP + 1, 1); gd_imp_slow = 1;
   for (const char* p = list; *p;) {
     size_t n = strcspn(p, ",");
     int hit = 0;
@@ -2020,6 +2029,31 @@ extern "C" void dispatch(CPU* c, uint64_t a) {
     fflush(stderr); if (gd_die_hook) gd_die_hook(); _exit(70);
   }
   die("indirect branch to an unmapped target", a);
+}
+/* gd_icall_slow (gdyld dispatch_text), before dispatch(): a host function that dispatch() would reach through its typed
+   native slot (a malloc zone's size, free, ...) gets a GPair of its own, a thunk from a fixed pool, so the call site's inline
+   cache serves the next calls without dispatch's search; none when the pool is full or dispatch would resolve it otherwise */
+struct NPair { uint64_t a; void (*f)(CPU*); const NSlot* s; };   /* a, f: recompile GPair's layout */
+static NPair npair[16];
+static int npair_n;
+static pthread_mutex_t npair_mu = PTHREAD_MUTEX_INITIALIZER;
+template<int I> static void nthunk(CPU* c) {
+  const NPair& e = npair[I];
+  TlsRestore g{tls_cur}; tls_cur = c;
+  go::host_side(c, [&] { e.s->call(c, (void*)(uintptr_t)e.a); });
+}
+extern "C" const void* gd_native_pair(uint64_t a) {
+  static void (*const th[])(CPU*) = {&nthunk<0>, &nthunk<1>, &nthunk<2>, &nthunk<3>, &nthunk<4>, &nthunk<5>, &nthunk<6>, &nthunk<7>,
+    &nthunk<8>, &nthunk<9>, &nthunk<10>, &nthunk<11>, &nthunk<12>, &nthunk<13>, &nthunk<14>, &nthunk<15>};
+  if (import_slot(a) >= 0 || handle_index(a) >= 0 || gd::host_target(a) || go::clo_target(a) || gsw::tramp_target(a)) return nullptr;
+  const NSlot* s = gd::native_slot(a);
+  if (!s) return nullptr;
+  pthread_mutex_lock(&npair_mu);
+  const NPair* r = nullptr;
+  for (int i = 0; i < npair_n && !r; i++) if (npair[i].a == a) r = &npair[i];
+  if (!r && npair_n < (int)(sizeof th / sizeof th[0])) { npair[npair_n] = NPair{a, th[npair_n], s}; r = &npair[npair_n++]; }
+  pthread_mutex_unlock(&npair_mu);
+  return r;
 }
 static void* map_at(uint64_t addr, size_t len, int prot) {    /* exact address or die; never MAP_FIXED over the host */
   void* p = mmap((void*)(uintptr_t)addr, len, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -2473,6 +2507,7 @@ int main(int argc, char** argv, char** envp) {
   }
   if (getenv("GDYLD_TRACE_IMPORTS")) {
     gd_trace = (unsigned*)calloc((size_t)NIMP + 1, sizeof(unsigned)); gd_first = (unsigned*)calloc((size_t)NIMP + 1, sizeof(unsigned));
+    gd_imp_slow = 1;
     atexit(gd_trace_dump); gd_die_hook = gd_trace_dump;
   }
   map_at(GD_IMPORT_BASE, ((size_t)NIMP * GD_IMP_SLOT + pg) & ~(pg - 1), PROT_READ | PROT_WRITE);

@@ -63,6 +63,10 @@ LANE_BYTES = {"u8": 1, "u16": 2, "u32": 4, "u64": 8, "f32": 4, "f64": 8}
 ABI_CS = sum(1 << LOCAL_BIT[n] for n in ["gr_x%d" % i for i in range(19, 29)] + ["gr_v%d" % i for i in range(8, 16)])   # callee-saved
 ABI_EXTRA = ABI_NOT_IN | ABI_CS                                        # what a call under the contract does not pass
 SAVE_OPS = {"stp", "stnp", "str", "stur"}                              # stores that can be a prologue save
+CSE_KEEP = "!GD_ABI || !defined(GD_CSE) || defined(GDA_K_%x)"          # an unread prologue save stays (saved_reads; gdyld GD_CSE, GDA_K_)
+NARROW_ACCESS = {"ldrb": 1, "ldurb": 1, "ldrsb": 1, "ldursb": 1, "ldrh": 2, "ldurh": 2, "ldrsh": 2, "ldursh": 2, "ldrsw": 4,
+                 "ldursw": 4, "ldpsw": 4, "strb": 1, "sturb": 1, "strh": 2, "sturh": 2}   # bytes per register, narrower than it
+CS_STORE = re.compile(r"\*\(uint64_t\*\)\([^;]*?\) = \(uint64_t\)\((gr_x\d+)\);|\{ V128 _s=(gr_v\d+); \*\(uint64_t\*\)\([^;]*?\)=_s\.u64\[0\]; \}")
 NAN_OP = re.compile(r"^\{ (?:V128 _[abd]=c->V\[\d+\]; )+V128 _r=\{0\}; .*c->V\[(\d+)\]=_r; \}$")   # a lift_neon FAST op (one instruction)
 NAN_CHK = re.compile(r" (?:gv4i|gv2l) _m=_r\.vf(?:32|64)!=_r\.vf(?:32|64); if \(__builtin_expect\(\(__builtin_ia32_movmsk(?:ps|pd)"
                      r"\(\((?:gv4f|gv2d)\)_m\) & \d+\)!=0, 0\)\) \{ _r\.vf(?:32|64)=n_fixv_\w+\(.*?\); \}")   # its per-op NaN check
@@ -139,6 +143,9 @@ extern const GPair gd_nopair;
 void gd_icall_slow(CPU*c,uint64_t t,const GPair**ic);
 #define GD_ICALL(t) do { static const GPair* _ic = &gd_nopair; const GPair* _p = __atomic_load_n(&_ic, __ATOMIC_RELAXED); \
   if (__builtin_expect(_p->a == (t), 1)) _p->f(c); else gd_icall_slow(c, (t), &_ic); } while (0)   /* per-site inline cache */
+extern int gd_imp_slow;                                                 /* gbridge: an import diagnostic is armed */
+#define GDL_P(i) ((void*)(uintptr_t)c->X[i])
+#define GD_LEAF(s, e) if (__builtin_expect(_t == (s) && !gd_imp_slow, 1)) { e; } else   /* gdyld GDL_<got>: the leaf import, called here */
 typedef struct { const void* e; } GMsgIC;                               /* per-site objc_msgSend cache (gobjc.hpp MIc) */
 void gd_msgsend(CPU*c,GMsgIC*ic,int k,uint64_t s);
 #ifndef GD_MSG_SLOT0
@@ -758,6 +765,20 @@ def jump_table(insns: list, j: int, lo: int, hi: int, read: object, joins: set, 
     if hoist is not None: hoist["uses"] += pend
     return tg
 
+def table_load(insns: list, k: int, joins: set) -> int | None:
+    """Index of the table load whose entry the br at insns[k] adds to a base (br_kind's 'table' idiom: `add T, B, E` fed by `ld E, [tab, idx]`, mov copies of T followed), else None."""
+    reg = xname(insns[k].reg_name(insns[k].operands[0].reg))
+    for _hop in range(4):
+        j = find_def(insns, k, reg, joins)
+        if j is None: return None
+        i = insns[j]; ops = i.operands
+        if i.mnemonic == "mov" and len(ops) == 2 and ops[1].type == ARM64_OP_REG:
+            k, reg = j, xname(i.reg_name(ops[1].reg)); continue
+        if i.mnemonic != "add" or len(ops) != 3 or ops[2].type != ARM64_OP_REG: return None
+        jl = find_def(insns, j, xname(i.reg_name(ops[2].reg)), joins)
+        return jl if jl is not None and insns[jl].mnemonic in TABLE_LOADS else None
+    return None
+
 def br_kind(insns: list, k: int, lo: int, hi: int, read: object, joins: set, hoist: dict | None = None) -> tuple[str, list]:
     """Classify the br at insns[k]: ('table'|'const', in-function targets), ('tail', []) constant target outside the function, ('pointer', []) a code pointer from an argument, call or memory, ('undecoded', []) anything else."""
     reg = xname(insns[k].reg_name(insns[k].operands[0].reg))
@@ -1027,7 +1048,7 @@ def saved_by(ins: object, d: int | None) -> int:
 
 def abi_check(parts: list[tuple[int, str]], edges: list, entries: list[int], insns: list, fstarts: set,
               noret: frozenset = frozenset(), brt: dict | None = None, sites: dict | None = None, blind: frozenset = frozenset()) -> tuple[dict, tuple]:
-    """({index of a direct call: mask of the ABI_NOT_OUT registers read after it}: the site reloads them all and the callee keeps every store at its returns, gdyld GDA_RET_<callee>; compiled code does this for an undefined value or a callee with its own convention, (reads, writes, calls)): what gdyld abi_plan closes over the image's calls to tell which functions break the AAPCS64 register contract GD_ABI relies on, as machine-outlined bodies do: reads, the ABI_EXTRA registers live at the entry (read before written); writes, the callee-saved registers written where no prologue save (saved_by, stored below the entry sp on every path there) came first; calls, [(sites[index], ABI_EXTRA registers that may still hold their entry values there and are not yet saved (owned), callee-saved registers saved on every path there)] per reached call or tail call site (sites: index -> ('d', callee) or ('g', GOT vmaddr)). Backward liveness over the lifted text (parts with locals): a read is a mention that is not an assignment (lift_neon's unused _d copy is none), a prologue save, or of a callee-saved register already saved on every path there (the function owns it; its reads past correlated branches the liveness cannot follow are its own), a text without `if (` kills what it assigns whole (a V register: all 16 bytes of its lanes), a call kills ABI_CLOBBER (what it reads is the callee's own entry check), a direct call into noret has no successor, and an exit or br keeps the results live (a br reaches its own decoded table's targets (brt: index -> target indices; else every case but the function start, a tail call that sets its own arguments), and an undecoded one (blind) has no successor here: a compiled jump table's targets read only what is defined at the br, never an entry value of ABI_EXTRA registers, and write callee-saved registers only after the prologue saves before it, while its edges to every word make every register look live and every save look skipped); a callee-saved register is not live at an exit, its value is not read there."""
+    """({index of a direct call: mask of the ABI_NOT_OUT registers read after it}: the site reloads them all and the callee keeps every store at its returns, gdyld GDA_RET_<callee>; compiled code does this for an undefined value or a callee with its own convention, (reads, writes, calls), the unread prologue saves (saved_reads; none when a call is read past)): what gdyld abi_plan closes over the image's calls to tell which functions break the AAPCS64 register contract GD_ABI relies on, as machine-outlined bodies do: reads, the ABI_EXTRA registers live at the entry (read before written) or whose entry values a load takes back from their save slots (saved_reads); writes, the callee-saved registers written where no prologue save (saved_by, stored below the entry sp on every path there) came first; calls, [(sites[index], ABI_EXTRA registers that may still hold their entry values there and are not yet saved (owned), callee-saved registers saved on every path there)] per reached call or tail call site (sites: index -> ('d', callee) or ('g', GOT vmaddr)). Backward liveness over the lifted text (parts with locals): a read is a mention that is not an assignment (lift_neon's unused _d copy is none), a prologue save, or of a callee-saved register already saved on every path there (the function owns it; its reads past correlated branches the liveness cannot follow are its own), a text without `if (` kills what it assigns whole (a V register: all 16 bytes of its lanes), a call kills ABI_CLOBBER (what it reads is the callee's own entry check), a direct call into noret has no successor, and an exit or br keeps the results live (a br reaches its own decoded table's targets (brt: index -> target indices; else every case but the function start, a tail call that sets its own arguments), and an undecoded one (blind) has no successor here: a compiled jump table's targets read only what is defined at the br, never an entry value of ABI_EXTRA registers, and write callee-saved registers only after the prologue saves before it, while its edges to every word make every register look live and every save look skipped); a callee-saved register is not live at an exit, its value is not read there."""
     n, texts = len(edges), {}
     for i, t in parts:
         if i >= 0: texts[i] = texts.get(i, "") + t + "\n"
@@ -1074,6 +1095,7 @@ def abi_check(parts: list[tuple[int, str]], edges: list, entries: list[int], ins
         saved[e] = s if saved[e] is None else saved[e] & s
         entry[e] = v if entry[e] is None else entry[e] | v
     flow(saved, list(entries[1:]), save_step, both); flow(entry, list(entries[1:]), entry_step, either)
+    raw = list(rd)
     for i in range(n): rd[i] &= ~sv[i] & ~(ABI_CS & (saved[i] or 0))   # a function that saved a register owns it
     exit_live = ABI_OUT & ~NZCV_BITS
     live, work = [0] * n, list(range(n))
@@ -1093,7 +1115,77 @@ def abi_check(parts: list[tuple[int, str]], edges: list, entries: list[int], ins
     for i in range(n):
         if saved[i] is not None: wrote |= anyw[i] & ABI_CS & ~saved[i]
     calls = [(r, entry[i] & ABI_EXTRA & ~saved[i], saved[i]) for i, r in sorted((sites or {}).items()) if saved[i] is not None]
-    return late, (live[0] & ABI_EXTRA, wrote, calls)
+    unread, back = saved_reads(insns, succs, preds, entries, spd, sv, anyw, kl, raw, flow)
+    return late, (live[0] & ABI_EXTRA | back, wrote, calls), ({} if late else unread)
+
+def saved_reads(insns: list, succs: list, preds: list, entries: list[int], spd: list, sv: list, anyw: list, kl: list, raw: list,
+                flow: object) -> tuple[dict[int, int], int]:
+    """(unread, read) for abi_check's prologue saves, the stores of callee-saved registers that hold their entry values on every path there: read, the callee-saved registers whose entry value a load takes back from its save slot into a register then used (any but a callee-saved one, or one live after it: liveness over the unmasked reads `raw` and abi_check's kills `kl`, no callee-saved register live at an exit), which reads the caller's register the way an entry read does; unread ({index: registers}), the saves no such load reads, in a function with one entry. A load may read a slot when it is sp- or fp-based at an offset that overlaps the slot, or at an unknown one (x29 set from sp by add or mov keeps its offset), on a path where no store at a known offset covered the slot since the save; other bases point into objects, not save slots. Under the register contract callers keep these registers themselves, so an unread save only feeds the epilogue's restore, whose result is dead, and a guest unwinder (gdyld GD_CSE: none loaded): localize puts it under CSE_KEEP."""
+    n, every = len(insns), (1 << len(LOCAL_AT)) - 1
+    must = [None] * n; must[0] = every                                 # holds the entry value on every path
+    flow(must, [0], lambda i, v: v & ~anyw[i], lambda a, b: a & b)
+    def span(ins: object, d: int) -> tuple[int, int, list]:
+        m = [o for o in ins.operands if o.type == ARM64_OP_MEM][0].mem
+        regs = [ins.reg_name(o.reg) for o in ins.operands if o.type == ARM64_OP_REG]
+        a = d + (0 if ins.post_index else m.disp)
+        size = NARROW_ACCESS.get(ins.mnemonic, 0)
+        return a, a + sum(size or {"q": 16, "v": 16, "x": 8, "d": 8, "w": 4, "s": 4, "h": 2, "b": 1}.get(r[0], 16) for r in regs), regs
+    slots = []                                                         # (save index, register bit, first byte, end) per saved register
+    for i in range(n):
+        if not sv[i] or must[i] is None or not isinstance(spd[i], int) or sv[i] & ~must[i]: continue
+        a, _e, regs = span(insns[i], spd[i])
+        if mask_of("gr_x" + r[1:] if r[0] == "x" else "gr_v" + r[1:] for r in regs if r[0] in "xd" and r[1:].isdigit()) != sv[i] or len(regs) != bin(sv[i]).count("1"):
+            continue                                                   # a q register or a register outside the contract's saves
+        for k, r in enumerate(regs):
+            slots.append((i, 1 << LOCAL_BIT["gr_x" + r[1:] if r[0] == "x" else "gr_v" + r[1:]], a + 8 * k, a + 8 * k + 8))
+    if not slots: return {}, 0
+    unseen, work = object(), [0]                                       # x29 less the entry sp: one value on every path, else None
+    fpd = [unseen] * n; fpd[0] = None
+    for e in entries[1:]: fpd[e] = None; work.append(e)
+    while work:
+        i = work.pop(); ins = insns[i]; d = fpd[i]
+        if "x29" in writes(ins):
+            o = ins.operands
+            d = (spd[i] + (o[2].imm if len(o) == 3 else 0)) if ins.mnemonic in ("add", "mov") and len(o) in (2, 3) and o[1].type == ARM64_OP_REG \
+                and ins.reg_name(o[1].reg) == "sp" and (len(o) == 2 or o[2].type == ARM64_OP_IMM and not o[2].shift.type) and isinstance(spd[i], int) else None
+        for s in succs[i]:
+            if fpd[s] is unseen: fpd[s] = d; work.append(s)
+            elif fpd[s] is not None and fpd[s] != d: fpd[s] = None; work.append(s)
+    def access(ins: object, j: int) -> tuple[int, int] | None | bool:
+        """(first byte, end) of a stack access off sp or x29, None at an unknown offset, False for any other base."""
+        mem = [o for o in ins.operands if o.type == ARM64_OP_MEM]
+        base = ins.reg_name(mem[0].mem.base) if mem else ""
+        if base not in ("sp", "x29", "fp"): return False
+        d = spd[j] if base == "sp" else fpd[j]
+        if mem[0].mem.index or not isinstance(d, int): return None
+        a, e, _r = span(ins, d)
+        return a, max(e, a + 1)
+    gen, kill = [0] * n, [0] * n
+    for j, ins in enumerate(insns):
+        if ins.mnemonic.startswith("st") and ins.mnemonic != DATA_MNEMONIC and (r := access(ins, j)):
+            for k, (i, _b, a, e) in enumerate(slots):
+                if i == j: gen[j] |= 1 << k
+                elif r[0] <= a and e <= r[1]: kill[j] |= 1 << k      # the whole slot overwritten
+    held = [None] * n; held[0] = 0                                     # slots that may still hold the entry value
+    for e in entries[1:]: held[e] = (1 << len(slots)) - 1
+    flow(held, [0] + list(entries[1:]), lambda i, v: v & ~kill[i] | gen[i], lambda a, b: a | b)
+    live, work = [0] * n, list(range(n))
+    while work:
+        i = work.pop()
+        out = 0
+        for s in succs[i]: out |= live[s]
+        v = raw[i] | out & ~kl[i]
+        if v != live[i]: live[i] = v; work += preds[i]
+    read, used = 0, set()
+    for j, ins in enumerate(insns):
+        if not ins.mnemonic.startswith("ld") or ins.mnemonic == DATA_MNEMONIC or not held[j] or (r := access(ins, j)) is False: continue
+        after = 0
+        for s in succs[j]: after |= live[s]
+        dest = anyw[j] & ~(1 << LOCAL_BIT["gr_sp"])
+        if not (dest & ~ABI_CS or dest & after): continue
+        for k, (i, b, a, e) in enumerate(slots):
+            if held[j] >> k & 1 and (r is None or a < r[1] and r[0] < e): read |= b; used.add(i)
+    return ({} if entries[1:] else {i: sv[i] for i, _b, _a, _e in slots if i not in used}), read
 
 def place_edge_spills(parts: list[tuple[int, str]], spills: dict, insns: list, split: bool = False) -> list[tuple[int, str]]:
     """parts with each loop_entry_spills store placed on its edge: inside the predecessor's `goto L_<head>;` and after its last part when it falls into the head (split: abi_split against ABI_IN)."""
@@ -1117,12 +1209,12 @@ def localize(parts: list[tuple[int, str]], edges: list, entries: list[int], regs
     parts = [(n, t.replace("return;", "GD_SPILLR return;") if "return;" in t else t) for n, t in parts]   # every exit but a tail call's
     lparts = [(n, REG_REF.sub(local_of, t.replace("flags_add(c, ", "flags_add_l(&c->NF,&c->ZF,&c->CF,&c->VF, "))
                    .replace("GD_SPW;", "c->SP=gr_sp; GD_SIGF;")) for n, t in parts]
-    late, fn = abi_check(lparts, edges, entries, insns, fstarts, noret, brt, sites, blind) if abi else ({}, None)
+    late, fn, cse = abi_check(lparts, edges, entries, insns, fstarts, noret, brt, sites, blind) if abi else ({}, None, {})
     why = {"abi_late": {insns[i].operands[0].imm: m for i, m in late.items()}, "abi_fn": fn} if abi else {}
     if not regs: return ("\n".join(SPILL_MARK.sub("", t).replace(RELOAD, "").replace(TAIL, "return;") for _n, t in parts), "",
                          {**flag_facts(lparts, edges, entries, insns, fstarts, blind), **why})
     split = abi and len(entries) == 1
-    parts = lparts
+    parts = [(n, cs_keep(t, cse[n], insns[0].address) if split and n in cse else t) for n, t in lparts]
     writes, every, texts = [0] * len(edges), 0, {}
     for n, t in parts:
         w = mask_of(a or b for a, b in LOCAL_WRITE.findall(t))
@@ -1152,6 +1244,14 @@ def localize(parts: list[tuple[int, str]], edges: list, entries: list[int], regs
                                                    split and n not in late, (back if m.group(1) == "R" or TAIL in t else "!GD_ABI") + site.get(n, "")), t)
         body.append(t.replace(RELOAD, full if n in late else reload_of(site.get(n, ""))).replace(TAIL, "return;") if "GD_" in t else t)
     return "\n".join(body), "".join("  %s %s=%s;\n" % (local_type(n), n, field_of(n)) for n in names), facts
+
+def cs_keep(t: str, mask: int, start: int) -> str:
+    """t with its stores of the callee-saved registers in mask under CSE_KEEP (saved_reads), unchanged unless each has one."""
+    hits = [m for m in CS_STORE.finditer(t) if mask >> LOCAL_BIT[m.group(1) or m.group(2)] & 1]
+    if len(hits) != bin(mask).count("1"): return t
+    keep = CSE_KEEP % start
+    at = {m.span() for m in hits}
+    return CS_STORE.sub(lambda m: "\n#if %s\n%s\n#endif\n" % (keep, m.group(0)) if m.span() in at else m.group(0), t)
 
 def flag_capture(ins: object) -> tuple[str, int, str] | None:
     """(kind, width, C statements saving the setter's source operands into gf_a/gf_b or gf_fa/gf_fb before it runs) for a compare-like NZCV setter FUSED can rewrite readers of, else None."""
@@ -1194,9 +1294,10 @@ def icall_of(msgk: int | None) -> str:
     return "GD_ICALL(_t);" if msgk is None else "GD_MSGSEND(_t, %d, GD_MSG_SLOT%d);" % (msgk, msgk)
 
 def got_call(got: int, ret: int | None, msgk: int | None = None) -> str:
-    """Call through an import stub's GOT slot (x16 = target, as the stub's adrp/ldr/br leaves it) via the site's inline cache; ret: the return address of a bl, None for a tail call; msgk: the GOT is bound to that objc_msgSend family member (icall_of)."""
+    """Call through an import stub's GOT slot (x16 = target, as the stub's adrp/ldr/br leaves it) via the site's inline cache, or, when gdyld defines GDL_<got> (the slot is bound to a LEAF_DIRECT import) and the slot still holds that import, the host function itself; ret: the return address of a bl, None for a tail call; msgk: the GOT is bound to that objc_msgSend family member (icall_of)."""
     lr = "c->X[30] = 0x%xULL + GUEST_BASE; " % ret if ret is not None else ""
-    head = "{ uint64_t _t = *(volatile uint64_t*)(0x%xULL + GUEST_BASE); c->X[16] = _t; %s%s%s" % (got, lr, SPILL, icall_of(msgk))
+    leaf = "\n#ifdef GDL_%x\nGDL_%x\n#endif\n" % (got, got) if msgk is None else ""   # gdyld: the slot's leaf import, inline
+    head = "{ uint64_t _t = *(volatile uint64_t*)(0x%xULL + GUEST_BASE); c->X[16] = _t; %s%s%s%s" % (got, lr, SPILL, leaf, icall_of(msgk))
     return head + (" } GD_RC(0x%xULL)%s" % (ret, RELOAD) if ret is not None else " %s }" % TAIL)
 
 def got_load(insns: list, k: int, reg: str, joins: set) -> int | None:
@@ -1258,6 +1359,10 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
     reached, brs, fallback = reach(insns, [insns[0].address] + list(resume or []), read, inside)
     joins = jump_edges(insns) | set(resume or []) | {t for _k, ts in brs.values() for t in ts}   # where another path may enter
     fz, fused = None, False                                            # flag_capture state reaching this instruction on its one path
+    pos = {ins.address: n for n, ins in enumerate(insns)}
+    jtab = {} if fallback else {jl: (pos[a], tg) for a, (kd, tg) in brs.items() if kd == "table"
+                                 for jl in [table_load(insns, pos[a], joins)] if jl is not None}   # table load -> (its br, targets)
+    jbr = {kb: tg for kb, tg in jtab.values()}
     for n, ins in enumerate(insns):
         if ins.address not in reached:                                 # never reached by control flow: data, not lifted
             if n == 0 or insns[n - 1].address in reached:
@@ -1271,6 +1376,9 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
         k0 = len(body)
         cap = None if fallback else flag_capture(ins)
         if cap: body.append((n, "  " + cap[2])); fused = True
+        if n in jtab:                                                  # the table index, before the load may overwrite it: its br
+                                                                       # switches on it (a table read_vm read is never written)
+            k, i, w = reg_parts(ins.reg_name(ins.operands[1].mem.index)); body.append((n, "  gd_jx = %s;" % rd(k, i, w)))
         try:
             if bm == "ret":
                 body.append((n, "  return;"))
@@ -1320,8 +1428,10 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
                 g = got_load(insns, n, xname(ins.reg_name(ins.operands[0].reg)), joins)
                 mk = msg.get(g) if msg else None
                 if g is not None: sites[n] = ("g", g)
-                body.append((n, "  { uint64_t _t = %s; if (_t - (0x%xULL + GUEST_BASE) < 0x%xULL) { gd_t = _t - GUEST_BASE; goto gd_ijump; }"
-                                " %s%s %s }" % (rd(k, i, 64), insns[0].address, insns[-1].address + 4 - insns[0].address, SPILL,
+                dense = "" if n not in jbr else " switch (gd_jx) { %s default: break; }" % " ".join(
+                    "case %d: goto L_%x ;" % (j, t) for j, t in enumerate(jbr[n]))   # spaced: not a place_edge_spills edge
+                body.append((n, "  { uint64_t _t = %s;%s if (_t - (0x%xULL + GUEST_BASE) < 0x%xULL) { gd_t = _t - GUEST_BASE; goto gd_ijump; }"
+                                " %s%s %s }" % (rd(k, i, 64), dense, insns[0].address, insns[-1].address + 4 - insns[0].address, SPILL,
                                                 icall if mk is None else icall_of(mk), TAIL)))
             else:
                 body.append((n, "  " + lift(ins, fstarts, calls).replace("\n", "\n  ")))
@@ -1336,7 +1446,7 @@ def lift_function_x(insns: list, fstarts: set, cname: str, resume: list | None =
         written = bm in ("bl", "blr") or FLAG_WRITE.search("".join(t for _i, t in body[k0:]))
         fz = (cap[0], cap[1]) if cap else None if written else fz
     body, gsv = (body, set()) if fallback else nan_groups(body, insns, joins)
-    pre = ("  uint64_t gd_t = 0;\n" if ijump else "") + ("  uint64_t gf_a = 0, gf_b = 0; double gf_fa = 0, gf_fb = 0;\n" if fused else "") \
+    pre = ("  uint64_t gd_t = 0;\n" if ijump else "") + ("  uint64_t gd_jx = 0;\n" if jtab else "") + ("  uint64_t gf_a = 0, gf_b = 0; double gf_fa = 0, gf_fb = 0;\n" if fused else "") \
         + "".join("  V128 gs_%d;\n" % r for r in sorted(gsv))           # before any goto (C++)
     body.append((-1, "  return;"))
     cases = (reached if fallback else {insns[0].address} | {t for _k, ts in brs.values() for t in ts}) if ijump else set()
