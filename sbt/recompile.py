@@ -986,7 +986,7 @@ def flow_edges(insns: list, reached: set, cases: set) -> list[tuple[list[int], b
         out.append(([at[t] for t in tg if t in at and t in reached] + nxt, m in ("bl", "blr")))
     return out
 
-def dirty_in(edges: list, writes: list[int], entries: list[int], edge_clean: dict | None = None, keep: int = 0) -> list[int | None]:
+def dirty_in(edges: list, writes: list[int], entries: list[int], edge_clean: dict | None = None, keep: int = 0, after_call: int = 0) -> list[int | None]:
     """Forward dataflow: mask of the locals that may differ from the CPU struct where each instruction starts (None: no C path reaches it). Entries start clean; a call leaves everything clean (stored before, reloaded after) but keep, which it may neither store nor reload (localize abi: callee-saved registers); edge_clean[(n, s)]: locals a spill on the edge n -> s stores (loop_entry_spills)."""
     din, work = [None] * len(edges), []
     for e in entries:
@@ -994,7 +994,7 @@ def dirty_in(edges: list, writes: list[int], entries: list[int], edge_clean: dic
     while work:
         n = work.pop()
         succ, call = edges[n]
-        out = (din[n] | writes[n]) & keep if call else din[n] | writes[n]
+        out = (din[n] | writes[n]) & keep | after_call if call else din[n] | writes[n]
         for s in succ:
             o = out & ~edge_clean.get((n, s), 0) if edge_clean else out
             if din[s] is None or din[s] | o != din[s]:
@@ -1020,6 +1020,16 @@ def loop_entry_spills(edges: list, writes: list[int], din: list, texts: dict, in
             m = (din[p] | writes[p]) & REG_BITS & ~inloop
             fall = h == p + 1 and insns[p].mnemonic not in NO_FALL
             if m and (fall or "goto L_%x;" % insns[h].address in texts.get(p, "")): out[(p, h)] = m
+    return out
+
+def prune_spills(edges: list, writes: list[int], entries: list[int], spills: dict, keep: int, split: bool) -> dict:
+    """spills (loop_entry_spills) less the locals already clean where each edge leaves its source once every spill is placed: an inner loop head's entry edge inside an outer loop would otherwise store, every turn, what the outer head's entry edge stored once. Under the register contract (split) a call reloads only ABI_BACK and the callee's return stores only ABI_OUT, so any other local but keep may differ from the CPU struct after a call (the callee's own calls stored its values there): this analysis counts them dirty past every call, which also covers the image built without the contract. Sound: on any path from a write or call to a pruned edge, the first spill edge sees the local dirty, so it keeps it."""
+    if not spills: return spills
+    din = dirty_in(edges, writes, entries, spills, keep, ((1 << len(LOCAL_AT)) - 1) & ~ABI_OUT & ~keep if split else 0)
+    out = {}
+    for (p, h), m in spills.items():
+        m &= din[p] | writes[p] if din[p] is not None else m
+        if m: out[(p, h)] = m
     return out
 
 def abi_split(mask: int, keep: int, fwrap: str, split: bool, cond: str = "!GD_ABI") -> str:
@@ -1226,7 +1236,7 @@ def localize(parts: list[tuple[int, str]], edges: list, entries: list[int], regs
         if n >= 0: writes[n] |= w; texts[n] = texts.get(n, "") + t
     keep = ABI_CS if split else 0
     din = dirty_in(edges, writes, entries, keep=keep)
-    spills = loop_entry_spills(edges, writes, din, texts, insns)
+    spills = prune_spills(edges, writes, entries, loop_entry_spills(edges, writes, din, texts, insns), keep, split)
     if spills:
         parts = place_edge_spills(parts, spills, insns, split)
         din = dirty_in(edges, writes, entries, spills, keep)
