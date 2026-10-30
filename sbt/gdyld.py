@@ -1306,7 +1306,7 @@ def flags_header(everywhere: bool, readers: set, returners: set, msg_slots: dict
                    + ["#define GD_CSE 1\n"] * cse + ["#define GDA_K_%x 1\n" % a for a in sorted(keep)] + ["#define GD_NORC 1\n"] * norc)
 
 def dispatch_text(images: list, nimp: int, leaf: frozenset = frozenset()) -> str:
-    """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache: a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called, and so is a host function a typed native slot bridges (gbridge gd_native_pair: a malloc zone's slots, a host value witness dispatch() has recognised); anything else goes to dispatch()."""
+    """gd_disp.c: gd_icall_slow, the miss path of every GD_ICALL inline cache (a hit in the shared cache spills nothing; the search is the noinline gd_icall_miss): a guest function start (m<k>_lookup_p of the image whose range holds it) or a host import slot (a gbridge thunk per import, gbridge_leaf for the slots in leaf: LEAF_IMPORTS bridged by prototype) is cached at the call site and called, and so is a host function a typed native slot bridges (gbridge gd_native_pair: a malloc zone's slots, a host value witness dispatch() has recognised); anything else goes to dispatch()."""
     find = " else ".join("if (t - 0x%xULL < 0x%xULL) p = m%d_lookup_p(t - 0x%xULL);" % (img["load"], img["vm_size"], k, img["slide"])
                          for k, img in enumerate(images))
     imps = "else if (t - 0x%xULL < 0x%xULL && (t - 0x%xULL) %% %d == 0) p = &gd_impp[(t - 0x%xULL) / %d];" % (
@@ -1318,11 +1318,14 @@ def dispatch_text(images: list, nimp: int, leaf: frozenset = frozenset()) -> str
                      + ["static const GPair gd_impp[] = {%s};" % (", ".join("{0x%xULL, gd_imp_%d}" % (IMPORT_BASE + k * IMP_SLOT, k)
                                                                           for k in range(nimp)) or "{1, 0}"),
                         "static const GPair* gd_gic[1 << 16];   /* shared cache of resolved targets: polymorphic sites skip the search */",
+                        "static __attribute__((noinline)) void gd_icall_miss(CPU* c, uint64_t t, const GPair** ic, const GPair** e) {"
+                        " const GPair* p = 0; %s %s if (!p) p = gd_native_pair(t); if (p) __atomic_store_n(e, p, __ATOMIC_RELAXED);"
+                        " if (p) { __atomic_store_n(ic, p, __ATOMIC_RELAXED); p->f(c); return; } dispatch(c, t); }" % (find, imps),
                         "void gd_icall_slow(CPU* c, uint64_t t, const GPair** ic) {"
                         " const GPair** e = &gd_gic[(uint32_t)((t >> 2) ^ (t >> 18)) & 0xffff];"
                         " const GPair* p = __atomic_load_n(e, __ATOMIC_RELAXED);"
-                        " if (!p || p->a != t) { p = 0; %s %s if (!p) p = gd_native_pair(t); if (p) __atomic_store_n(e, p, __ATOMIC_RELAXED); }"
-                        " if (p) { __atomic_store_n(ic, p, __ATOMIC_RELAXED); p->f(c); return; } dispatch(c, t); }" % (find, imps), ""])
+                        " if (__builtin_expect(p && p->a == t, 1)) { __atomic_store_n(ic, p, __ATOMIC_RELAXED); p->f(c); return; }"
+                        " gd_icall_miss(c, t, ic, e); }", ""])
 
 def cpu_typedefs() -> str:
     lines = [ln for ln in R.C_PRELUDE.splitlines() if ln.startswith(("typedef float gv4f", "typedef union {", "typedef struct { uint64_t X[31]"))]

@@ -182,6 +182,9 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
         "objc_umbrella": exe("objc_umbrella", ["objc_umbrella.c"], ["-framework", "Foundation"]),
         "cgoto": exe("cgoto", ["cgoto.c"], ["-O2"]),
         "cgoto_patch": exe("cgoto_patch", ["cgoto_patch.c"], ["-O2"]),
+        "icall_poly": exe("icall_poly", ["icall_poly.c"], ["-O2"]),
+        "icall_gic": [(lib("icall_gic", "icg"), ["icg_lib.c"], iname("icg") + ["-O2"])]
+                     + exe("icall_gic", ["icall_gic.c", lib("icall_gic", "icg")], ["-O2"]),
     }
 
 
