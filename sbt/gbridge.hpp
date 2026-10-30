@@ -1980,8 +1980,16 @@ extern "C" void gbridge_leaf(CPU* c, int k) {
   ENT[k].call(c, k);
 }
 /* recompile GD_MSGSEND: a send through import slot s, which gdyld bound to objc_msgSend (sup 0), objc_msgSendSuper (1) or
-   objc_msgSendSuper2 (2), with the call site's cache (gobjc.hpp msg_fast); a slot bridged otherwise goes through gbridge */
+   objc_msgSendSuper2 (2), with the call site's cache (gobjc.hpp msg_fast); a slot bridged otherwise goes through gbridge.
+   First, with no import diagnostic armed, an objc_msgSend site's cached guest method (gobjc.hpp msg_guest) is called with no
+   slot check: ENT is const, and the entry was cached past that check for this site's slot */
+__attribute__((noinline)) static void gd_msgsend_slow(CPU* c, go::MIc* ic, int sup, uint64_t s);
 extern "C" void gd_msgsend(CPU* c, go::MIc* ic, int sup, uint64_t s) {
+  if (__builtin_expect(sup == 0 && !gd_imp_slow, 1))
+    if (const go::MEnt* e = go::msg_guest(c, ic)) { e->f(c); return; }
+  gd_msgsend_slow(c, ic, sup, s);
+}
+static void gd_msgsend_slow(CPU* c, go::MIc* ic, int sup, uint64_t s) {
   int k = (int)((s - GD_IMPORT_BASE) / GD_IMP_SLOT);
   if (ENT[k].call != (sup == 0 ? &sp_objc_msgSend : sup == 1 ? &sp_objc_msgSendSuper : &sp_objc_msgSendSuper2)) { dispatch(c, s); return; }
   if (__builtin_expect(gd_stop != nullptr, 0) && gd_stop[k]) gd_stop_at(k);

@@ -918,6 +918,18 @@ template<class F> static void host_side(CPU* c, F&& f) {
   (void)c; f();
 #endif
 }
+extern "C" const uintptr_t objc_debug_isa_class_mask;  /* libobjc: the isa bits object_getClass reads for a non-tagged object */
+/* gbridge gd_msgsend's first try at an objc_msgSend site: the site's entry when it is a guest method, the receiver (not nil, not a
+   tagged pointer) is of its class, selector and epoch match, and libobjc still sends the pair to the entry's IMP (the check for
+   host-side changes, which bump no epoch); else null, and gd_msgsend takes its full path */
+static inline const MEnt* msg_guest(CPU* c, MIc* ic) {
+  const MEnt* e = __atomic_load_n(&ic->e, __ATOMIC_ACQUIRE);
+  uintptr_t x0 = (uintptr_t)c->X[0];
+  if (!e || !x0 || (x0 & 1) || e->kind != MS_GUEST || (Class)(*(const uintptr_t*)x0 & objc_debug_isa_class_mask) != e->cls ||
+      e->sel != (SEL)(uintptr_t)c->X[1] || e->ep != __atomic_load_n(&M_EP, __ATOMIC_ACQUIRE) || gd_msglookup((id)x0, e->sel) != e->imp)
+    return nullptr;
+  return e;
+}
 /* a cached send (per-call-site send cache above): true when done here (nil receiver, or the site's entry matches);
    else gbridge's gd_msgsend runs send(c, sup, ic) */
 static inline bool msg_fast(CPU* c, MIc* ic, int sup) {
